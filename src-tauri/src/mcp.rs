@@ -26,6 +26,8 @@ pub struct McpTool {
     pub input_schema: Value,
 }
 
+// One connection per server, so the size difference between the two kinds does not matter.
+#[allow(clippy::large_enum_variant)]
 enum Transport {
     Stdio {
         stdin: tokio::sync::Mutex<tokio::process::ChildStdin>,

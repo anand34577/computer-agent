@@ -82,29 +82,93 @@ pub fn blocked_context(snap: &Snapshot, s: &AppSettings) -> Option<String> {
     None
 }
 
+/// Tools whose requests leave this computer and can carry data in an address, query or body.
+pub const OUTBOUND: &[&str] = &["fetch_url", "web_search", "http_request", "download_file"];
+
+/// Tools that bring local or private data into the conversation; after one runs, outbound
+/// requests need approval (see `outbound`).
+pub const READS_LOCAL: &[&str] = &[
+    "read_file", "grep_files", "search_files", "list_files", "file_info", "clipboard_read", "run_command", "list_processes", "system_info", "search_documents",
+];
+
+/// Extensions the OS runs as programs when "opened".
+const EXECUTABLE_EXTS: &[&str] = &[
+    "exe", "msi", "msix", "appx", "bat", "cmd", "com", "scr", "pif", "ps1", "psm1", "vbs", "vbe", "js", "jse", "wsf", "wsh", "hta",
+    "lnk", "url", "reg", "cpl", "jar", "sh", "command", "app", "pkg", "dmg", "deb", "rpm", "appimage", "run", "py", "pyw",
+];
+
+/// Whether opening this path or name would run a program rather than show a document.
+pub fn is_executable(path_or_name: &str) -> bool {
+    let p = path_or_name.trim().trim_matches('"').to_lowercase();
+    let p = p.split(['?', '#']).next().unwrap_or("");
+    std::path::Path::new(p).extension().and_then(|e| e.to_str()).map(|e| EXECUTABLE_EXTS.contains(&e)).unwrap_or(false)
+}
+
+/// Extra risk of a web address: cloud metadata services are never reachable, and devices on this
+/// computer or the home network need the user's OK (routers, local servers, admin pages).
+pub fn network_risk(url: &str) -> Option<Verdict> {
+    let host = reqwest::Url::parse(url.trim()).ok().and_then(|u| u.host_str().map(|h| h.trim_matches(['[', ']']).to_lowercase()))?;
+    if host.starts_with("169.254.") || host == "metadata.google.internal" || host == "fd00:ec2::254" {
+        return Some(Verdict::new(Level::Blocked, "Cloud metadata addresses are never contacted"));
+    }
+    if crate::validate::is_local_url(url) {
+        return Some(Verdict::new(Level::Gate, format!("Contacts {host}, a device on this computer or your local network")));
+    }
+    None
+}
+
+/// Outbound requests after the session read local data (files, clipboard, documents, command
+/// output) could carry that data away, so they need approval. `_tainted` is set by the engine.
+fn outbound(tool: &str, args: &Value, read_only: Verdict) -> Verdict {
+    let url = args["url"].as_str().unwrap_or("");
+    if let Some(v) = network_risk(url) {
+        return v;
+    }
+    if args["_tainted"] == true {
+        let what = match tool {
+            "web_search" => format!("Searches the web for \"{}\"", crate::a11y::trunc(args["query"].as_str().unwrap_or(""), 120)),
+            _ => format!("Contacts {}", crate::a11y::trunc(url, 160)),
+        };
+        return Verdict::new(Level::Gate, format!("{what} after reading your data. Check that it sends nothing private."));
+    }
+    read_only
+}
+
 pub fn classify(tool: &str, args: &Value, snap: &Snapshot, target: Option<&Elem>, s: &AppSettings) -> Verdict {
     let ctx_app = format!("{} {}", snap.app, snap.window_title).to_lowercase();
     let target_name = target.map(|e| format!("{} {}", e.name, e.role)).unwrap_or_default();
     let is_input_action = matches!(tool, "click" | "type_text" | "press_keys" | "drag" | "hover" | "scroll");
 
     match tool {
-        "wait" | "done" | "ask_user" | "list_files" | "read_file" | "read_screen" | "clipboard_read" | "search_files" | "system_info" | "fetch_url" | "web_search" => {
+        "fetch_url" | "web_search" => return outbound(tool, args, Verdict::new(Level::Observe, "read-only")),
+        "wait" | "done" | "ask_user" | "list_files" | "read_file" | "read_screen" | "clipboard_read" | "search_files" | "system_info" => {
             return Verdict::new(Level::Observe, "read-only")
         }
         "notify_user" => return Verdict::new(Level::Routine, "notification"),
         "grep_files" | "file_info" | "list_processes" | "calculate" => return Verdict::new(Level::Observe, "read-only"),
         "http_request" => {
             let m = args["method"].as_str().unwrap_or("GET").to_uppercase();
-            return if m == "GET" || m == "HEAD" {
+            let base = if m == "GET" || m == "HEAD" {
                 Verdict::new(Level::Observe, "read-only web request")
             } else {
                 Verdict::new(Level::Risky, format!("Sends a {m} request that may change data on {}", args["url"].as_str().unwrap_or("a server")))
             };
+            let v = outbound(tool, args, base.clone());
+            return if v.level > base.level { v } else { base };
         }
-        "download_file" => return Verdict::new(Level::Risky, "Downloads a file from the internet"),
+        "download_file" => return outbound(tool, args, Verdict::new(Level::Risky, "Downloads a file from the internet")),
         "copy_file" | "zip_files" | "unzip_file" => return Verdict::new(Level::Risky, "Creates new files (can be undone)"),
         "kill_process" => return Verdict::new(Level::Gate, "Stops a running program; unsaved work in it may be lost"),
-        "open_path" => return Verdict::new(Level::Risky, "Opens a file or folder with its default app"),
+        "open_path" => {
+            let p = args["path"].as_str().unwrap_or("");
+            return if is_executable(p) {
+                Verdict::new(Level::Gate, "Opening this file runs it as a program")
+            } else if p.starts_with("http://") || p.starts_with("https://") {
+                network_risk(p).unwrap_or_else(|| Verdict::new(Level::Risky, "Opens a web link in the browser"))
+            } else {
+                Verdict::new(Level::Risky, "Opens a file or folder with its default app")
+            };
+        }
         "run_command" => {
             return if args["_target"] == "sandbox" {
                 Verdict::new(Level::Risky, "Runs a command inside the isolated Linux sandbox")
@@ -191,7 +255,7 @@ pub fn classify(tool: &str, args: &Value, snap: &Snapshot, target: Option<&Elem>
             if n.contains("settings") || n.contains("control panel") || n.starts_with("ms-settings") {
                 return Verdict::new(Level::Gate, "Opening system settings");
             }
-            if n.contains("install") || n.ends_with(".exe") || n.ends_with(".msi") {
+            if n.contains("install") || is_executable(&n) || n.contains(['\\', '/']) {
                 return Verdict::new(Level::Gate, "Running an installer or program file");
             }
             for b in &s.blocked_apps {
@@ -211,8 +275,14 @@ pub fn classify(tool: &str, args: &Value, snap: &Snapshot, target: Option<&Elem>
                     return Verdict::new(Level::Blocked, format!("Sites matching '{b}' are blocked"));
                 }
             }
-            if [".exe", ".msi", ".dmg", ".pkg", ".deb", ".rpm", ".appimage", ".bat", ".ps1"].iter().any(|e| u.split('?').next().unwrap_or("").ends_with(e)) {
+            if is_executable(&u) {
                 return Verdict::new(Level::Gate, "This link downloads a program");
+            }
+            if args["_tainted"] == true && u.contains('?') {
+                return Verdict::new(Level::Gate, format!("Opens {} after reading your data. Check that the address carries nothing private.", crate::a11y::trunc(&u, 160)));
+            }
+            if let Some(v) = network_risk(&u) {
+                return v;
             }
             Verdict::new(Level::Routine, "open link")
         }
@@ -231,8 +301,10 @@ pub fn classify(tool: &str, args: &Value, snap: &Snapshot, target: Option<&Elem>
 pub fn needs_approval(v: &Verdict, autonomy: &str, escalated: bool) -> bool {
     match v.level {
         Level::Observe => false,
-        // Full access: the user accepted that the agent acts without asking. Hard blocks still hand over.
-        Level::Gate | Level::Risky | Level::Routine if autonomy == "full" => false,
+        // Full access: the user accepted that the agent acts without asking. Hard blocks still hand
+        // over, and once content tried to instruct the agent, fixed gates ask again.
+        Level::Gate if autonomy == "full" => escalated,
+        Level::Risky | Level::Routine if autonomy == "full" => false,
         Level::Blocked | Level::Gate => true,
         Level::Risky => autonomy != "autonomous" || escalated,
         Level::Routine => autonomy == "supervised" || escalated,
@@ -357,6 +429,29 @@ mod tests {
         assert!(needs_approval(&risky, "balanced", false));
         assert!(!needs_approval(&risky, "autonomous", false));
         assert!(needs_approval(&gate, "autonomous", false), "fixed gates hold at every level");
+    }
+
+    #[test]
+    fn programs_and_outbound_requests_are_gated() {
+        assert_eq!(classify("open_path", &json!({"path":"C:/Users/u/Downloads/setup.exe"}), &snap("", ""), None, &s()).level, Level::Gate);
+        assert_eq!(classify("open_path", &json!({"path":"C:/Users/u/run.BAT"}), &snap("", ""), None, &s()).level, Level::Gate);
+        assert_eq!(classify("open_path", &json!({"path":"C:/Users/u/report.pdf"}), &snap("", ""), None, &s()).level, Level::Risky);
+        assert_eq!(classify("open_app", &json!({"name":"C:/tmp/tool"}), &snap("", ""), None, &s()).level, Level::Gate);
+        assert_eq!(classify("fetch_url", &json!({"url":"https://example.com/"}), &snap("", ""), None, &s()).level, Level::Observe);
+        assert_eq!(classify("fetch_url", &json!({"url":"https://example.com/?d=secret", "_tainted": true}), &snap("", ""), None, &s()).level, Level::Gate);
+        assert_eq!(classify("web_search", &json!({"query":"x", "_tainted": true}), &snap("", ""), None, &s()).level, Level::Gate);
+        assert_eq!(classify("http_request", &json!({"url":"http://192.168.1.1/admin"}), &snap("", ""), None, &s()).level, Level::Gate);
+        assert_eq!(classify("fetch_url", &json!({"url":"http://169.254.169.254/latest/meta-data"}), &snap("", ""), None, &s()).level, Level::Blocked);
+        assert_eq!(classify("open_url", &json!({"url":"https://evil.example/?q=data", "_tainted": true}), &snap("", ""), None, &s()).level, Level::Gate);
+    }
+
+    #[test]
+    fn full_access_still_asks_after_injection() {
+        let gate = Verdict::new(Level::Gate, "");
+        assert!(!needs_approval(&gate, "full", false));
+        assert!(needs_approval(&gate, "full", true));
+        assert!(!needs_approval(&Verdict::new(Level::Risky, ""), "full", true));
+        assert!(needs_approval(&Verdict::new(Level::Blocked, ""), "full", false));
     }
 
     #[test]

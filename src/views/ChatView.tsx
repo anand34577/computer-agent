@@ -1,4 +1,5 @@
 import { isValidElement, memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useState, type ReactNode } from "react";
+import "katex/dist/katex.min.css";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
 import remarkMath from "remark-math";
@@ -9,11 +10,13 @@ import {
   Gauge, ListChecks, MoreHorizontal, MousePointerClick, Paperclip, Pause, Pencil, Pin, PinOff, Play, Printer, RefreshCw, Search, ShieldAlert, Square, SlidersHorizontal,
   Sparkles, ThumbsDown, ThumbsUp, Trash2, Volume2, VolumeX, WrapText, Wrench, X,
 } from "lucide-react";
-import { api, errText, fileToAttachment, money, on, type Attachment, type Conversation, type DocRef, type LlamaStatus, type Message } from "../api";
+import { api, errText, fileToAttachment, money, on, type Attachment, type Conversation, type DocRef, type LlamaStatus, type Message, type Step } from "../api";
 import { Callout, Checkbox, ConfirmDialog, Menu, Modal, NumberField, PromptDialog, Seg, Slider, Spinner, useApp } from "../components/common";
 import { printPdf, saveExport, toHTML, toJSON, toMarkdown } from "../exporters";
 import ModelPicker from "../components/ModelPicker";
+import { splitBlocks } from "../markdown";
 import { live, useLive, type LiveAgent, type LiveTool } from "../live";
+import { CallDetail, CancelCall, FastLine, PlanList, StepRow, StepShot, fmtMs, useElapsed } from "../components/AgentParts";
 
 /** Copies text and briefly shows a check mark. */
 function useCopy(): [string | null, (key: string, text: string) => void] {
@@ -57,19 +60,47 @@ function CodeBlock({ children }: { children?: ReactNode }) {
   );
 }
 
+/** Images in replies never load from the network on their own: a remote address could carry
+ * data out in its URL. Inline data images show; anything else becomes a link the user can open. */
+function SafeImage({ src, alt }: { src?: string; alt?: string }) {
+  if (src && /^data:image\/(png|jpe?g|gif|webp);base64,/i.test(src)) return <img src={src} alt={alt ?? ""} />;
+  let host = "";
+  try { host = src ? new URL(src).host : ""; } catch { /* not a URL */ }
+  return (
+    <a className="md-img-link" href={src} title={src}
+      onClick={(e) => { e.preventDefault(); if (src && /^https?:/i.test(src)) api.openLink(src); }}>
+      Image{alt ? `: ${alt}` : ""}{host ? ` (${host})` : ""}, not loaded. Open in browser
+    </a>
+  );
+}
+
 const MD_REMARK = [remarkGfm, remarkMath];
 const MD_REHYPE = [rehypeKatex, [rehypeHighlight, { detect: true }]] as never;
+const MD_LITE_REMARK = [remarkGfm];
+const MD_COMPONENTS = {
+  pre: CodeBlock,
+  a: ({ href, children }: { href?: string; children?: ReactNode }) => <a href={href} onClick={(e) => { e.preventDefault(); if (href && /^https?:/i.test(href)) api.openLink(href); }}>{children}</a>,
+  img: SafeImage,
+};
 const MD = memo(function MD({ text }: { text: string }) {
-  return (
-    <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE}
-      components={{
-        pre: CodeBlock,
-        a: ({ href, children }) => <a href={href} onClick={(e) => { e.preventDefault(); if (href && /^https?:/i.test(href)) api.openLink(href); }}>{children}</a>,
-      }}>
-      {text}
-    </ReactMarkdown>
-  );
+  return <ReactMarkdown remarkPlugins={MD_REMARK} rehypePlugins={MD_REHYPE} components={MD_COMPONENTS}>{text}</ReactMarkdown>;
 });
+/** Cheap render for the block still being written: no maths or syntax highlighting yet. */
+const MDLite = memo(function MDLite({ text }: { text: string }) {
+  return <ReactMarkdown remarkPlugins={MD_LITE_REMARK} components={MD_COMPONENTS}>{text}</ReactMarkdown>;
+});
+
+/** A streaming reply: each finished block is parsed once; only the last one re-renders per frame. */
+function StreamMD({ text }: { text: string }) {
+  const blocks = splitBlocks(text);
+  const last = blocks.pop() ?? "";
+  return (
+    <>
+      {blocks.map((b, i) => <MD key={i} text={b} />)}
+      <MDLite text={last} />
+    </>
+  );
+}
 
 /** Live or saved reasoning. Open while the model thinks, folds away when the answer starts. */
 function Thinking({ text, live: isLive, seconds }: { text: string; live: boolean; seconds?: number }) {
@@ -94,15 +125,19 @@ function ToolDrawer({ t }: { t: LiveTool }) {
   const isDoc = t.name === "document search";
   const isSub = t.name.startsWith("sub-agent");
   const Icon = isDoc ? Search : isSub ? Bot : Wrench;
-  const args = t.args && typeof t.args === "object" && Object.keys(t.args as object).length ? "```json\n" + JSON.stringify(t.args, null, 2) + "\n```" : "";
-  const failed = (t.result ?? "").startsWith("Error");
+  const failed = /^(Error|FAILED)/.test(t.result ?? "");
+  const cancelled = (t.result ?? "").includes("Cancelled by the user");
+  const secs = useElapsed(t.started, running);
   return (
-    <details className={"drawer tool" + (failed ? " failed" : "")}>
-      <summary>{running ? <Spinner size={13} /> : <Icon size={13} />} <span className="tool-name">{t.name}</span> <span className="muted">· {running ? "running…" : failed ? "failed" : "done"}</span><ChevronDown size={13} className="chev" /></summary>
-      <div className="tool-body">
-        {args && <div className="md"><MD text={args} /></div>}
-        {t.result && <div className="tool-result">{t.result}</div>}
-      </div>
+    <details className={"drawer tool" + (failed ? " failed" : "") + (running ? " running" : "")}>
+      <summary>{running ? <Spinner size={13} /> : <Icon size={13} />} <span className="tool-name">{t.title || t.name}</span>
+        <span className="muted">· {running ? `running${secs ? ` ${secs}s` : "…"}` : cancelled ? "cancelled" : failed ? "failed" : "done"}{!running && t.ms != null ? ` · ${fmtMs(t.ms)}` : ""}</span>
+        {running && <CancelCall callId={t.call_id} />}
+        {t.permission === "auto" && <span className="badge" title="This tool is set to run without asking. Change it in Extensions → Tools.">ran automatically</span>}
+        {t.permission === "asked" && <span className="badge" title="You approved this call.">approved by you</span>}
+        {t.permission === "declined" && <span className="badge" title="You declined this call, so it did not run.">declined by you</span>}
+        <ChevronDown size={13} className="chev" /></summary>
+      <div className="tool-body"><CallDetail args={t.args} result={t.result} /></div>
     </details>
   );
 }
@@ -146,7 +181,8 @@ const SLASH = [
 
 type PendingDoc = { key: string; name: string; status: "uploading" | "ready" | "error"; ref?: DocRef; error?: string; mode: "embed" | "direct" };
 
-export default function ChatView({ convId, setConvId, refreshConvs, agentRunning, goModels, playbooks }: {
+export default function ChatView({ convId, setConvId, refreshConvs, agentRunning, goModels, playbooks, deleteChat }: {
+  deleteChat: (c: { id: string; title: string }) => void;
   convId: string | null; setConvId: (id: string | null) => void; refreshConvs: () => Promise<void>; agentRunning: boolean; goModels: () => void;
   playbooks: { id: string; name: string; goal: string }[];
 }) {
@@ -165,7 +201,6 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
   const [editTitle, setEditTitle] = useState(false);
   const [chatSettings, setChatSettings] = useState(false);
   const [folderDlg, setFolderDlg] = useState(false);
-  const [confirmDelete, setConfirmDelete] = useState(false);
   const [confirmFull, setConfirmFull] = useState(false);
   const [thinkOn, setThinkOn] = useState(() => { try { return localStorage.getItem("think") !== "off"; } catch { return true; } });
   const [atBottom, setAtBottom] = useState(true);
@@ -299,6 +334,9 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
     if (inputError || docsBusy) return;
     if (!modelId) { toast("Add a model first.", "bad"); goModels(); return; }
     if (asAgent && text.trim().length < 3) { toast("Describe the task in a few words.", "bad"); return; }
+    // Kept so a failed send puts everything back instead of losing the message.
+    const draft = { input: raw, atts, docs };
+    let sent = false;
     try {
       const id = await ensureConv();
       if (!id) return;
@@ -311,17 +349,22 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
         return;
       }
       setInput("");
-      const a = atts;
       setAtts([]);
       setDocs([]);
       live.clearNotices(id);
       live.pending(id, model?.label ?? "");
-      await api.sendMessage(id, text, a, modelId, think, readyDocs);
+      await api.sendMessage(id, text, draft.atts, modelId, think, readyDocs);
+      sent = true;
       await load(id);
       refreshConvs();
     } catch (e) {
-      if (convRef.current) live.clearReply(convRef.current);
-      toast(errText(e), "bad");
+      if (convRef.current && !sent) {
+        live.clearReply(convRef.current);
+        setInput((cur) => cur || draft.input);
+        setAtts((cur) => (cur.length ? cur : draft.atts));
+        setDocs((cur) => (cur.length ? cur : draft.docs));
+      }
+      toast(sent ? errText(e) : `Your message was not sent: ${errText(e)}. It is back in the box so you can try again.`, "bad");
     }
   };
 
@@ -488,7 +531,7 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
               { label: "Export as web page", icon: FileCode, onClick: () => doExport("html") },
               { label: "Export as JSON", icon: FileJson, onClick: () => doExport("json") },
               "sep",
-              { label: "Delete chat", icon: Trash2, danger: true, onClick: () => setConfirmDelete(true) },
+              { label: "Delete chat", icon: Trash2, danger: true, onClick: () => deleteChat(conv) },
             ]} />
         )}
       </div>
@@ -544,7 +587,7 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
                 {elapsed >= 4 && !engineLoading && <span className="muted">· the model is reading the conversation{ctxUsed > 3000 ? ` (~${fmtK(ctxUsed)} tokens)` : ""}</span>}
               </div>
             ) : reply.text ? (
-              <div className="md streaming"><MD text={splitThink(reply.text).body} /></div>
+              <div className="md streaming"><StreamMD text={splitThink(reply.text).body} /></div>
             ) : null}
             {reply.pieces > 0 && (
               <div className="msg-actions show">
@@ -562,7 +605,7 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
                 const fb = lv.error!.fallback!;
                 live.clearError(conv.id);
                 setModelId(fb);
-                if (lastUser) { live.pending(conv.id, models.find((x) => x.id === fb)?.label ?? ""); await api.editAndResend(conv.id, lastUser.id, lastUser.content, fb); load(conv.id); }
+                if (lastUser) { live.pending(conv.id, models.find((x) => x.id === fb)?.label ?? ""); await api.editAndResend(conv.id, lastUser.id, lastUser.content, fb).catch((e) => { live.clearReply(conv.id); toast(errText(e), "bad"); }); load(conv.id); }
               }}>Retry with fallback model</button>
             ) : lastUser && conv ? (
               <button className="btn sm" onClick={async () => {
@@ -572,7 +615,7 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
                 await api.editAndResend(conv.id, lastUser.id, lastUser.content, modelId, think).catch((e) => { live.clearReply(conv.id); toast(errText(e), "bad"); });
                 load(conv.id);
               }}><RefreshCw size={13} /> Retry</button>
-            ) : undefined}>{lv.error.text}</Callout>
+            ) : undefined}><span style={{ whiteSpace: "pre-line" }}>{lv.error.text}</span></Callout>
           </div>
         )}
       </div>
@@ -695,11 +738,6 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
           <p>Only use it with a model you trust, for tasks you can watch. Passwords, sign-in screens, CAPTCHAs and off-limits apps still hand control back to you, and <span className="kbd">{settings.stop_shortcut}</span> stops everything at once.</p>
         </ConfirmDialog>
       )}
-      {confirmDelete && conv && (
-        <ConfirmDialog title="Delete chat?" onClose={() => setConfirmDelete(false)} onConfirm={async () => { await api.deleteConversation(conv.id); setConvId(null); await refreshConvs(); toast("Chat deleted", "ok"); }}>
-          “{conv.title}” and all its messages and documents will be removed from this computer.
-        </ConfirmDialog>
-      )}
       {folderDlg && conv && (
         <PromptDialog title="Move to folder" label="Folder name" hint="Leave empty to remove it from a folder" initial={conv.folder}
           validate={(v) => (v.length > 40 ? "Up to 40 characters" : /[\\/]/.test(v) ? "No slashes" : undefined)}
@@ -713,19 +751,39 @@ export default function ChatView({ convId, setConvId, refreshConvs, agentRunning
 const STEP_ICON: Record<string, typeof Bot> = { action: MousePointerClick, thought: Brain, plan: ListChecks, blocked: ShieldAlert, denied: X, stuck: AlertTriangle };
 
 function AgentLive({ a }: { a: LiveAgent }) {
-  const steps = a.steps.slice(-8);
+  const steps = a.steps.slice(-6);
   const paused = a.status === "paused";
   const thinking = !a.text && !!a.reasoning;
+  const running = a.tools.filter((t) => t.status === "running");
+  const lastShot = [...a.steps].reverse().find((s) => s.screenshot)?.screenshot;
+  const [big, setBig] = useState<string | null>(null);
+  const secs = useElapsed(a.started);
+  const note = a.thought || a.text.replace(/```[\s\S]*?(```|$)/g, "").replace(/^\s*\[[^\]]*\]\s*/, "").trim();
   return (
     <div className="msg live-msg">
-      <div className="who"><span className="avatar ai"><MousePointerClick size={13} /></span> Agent{a.model && <span className="muted" style={{ fontWeight: 500 }}>· {a.model}</span>}<span className="badge accent">step {a.step}</span></div>
+      <div className="who"><span className="avatar ai"><MousePointerClick size={13} /></span> Agent{a.model && <span className="muted" style={{ fontWeight: 500 }}>· {a.model}</span>}<span className="badge accent">step {a.step}</span><span className="muted small">{secs}s</span></div>
       <div className="agent-live">
         <div className="agent-live-head">
           {paused ? <Pause size={14} /> : <Spinner size={14} />}
-          <span className="grow ellipsis">{a.message || "Working…"}</span>
+          <span className="grow ellipsis" title={a.message}>{a.message || "Working…"}</span>
           <button className="btn sm" onClick={() => (paused ? api.agentResume() : api.agentPause())}>{paused ? <><Play size={13} /> Resume</> : <><Pause size={13} /> Pause</>}</button>
           <button className="btn sm danger" onClick={() => api.agentStop()}><Square size={12} /> Stop</button>
         </div>
+        <div className={"agent-live-body" + (lastShot ? " has-shot" : "")}>
+          <div className="agent-live-main">
+            {a.plan.length > 0 && <PlanList plan={a.plan} current={a.planStep} />}
+            {(a.doing || note) && (
+              <div className="agent-now">
+                {a.doing && <div><span className="agent-now-label">Now</span> {a.doing}</div>}
+                {note && <div className="muted"><span className="agent-now-label">Why</span> {note.length > 400 ? note.slice(0, 400) + "…" : note}</div>}
+                {a.plan.length > 0 && a.planStep > 0 && a.planStep < a.plan.length && <div className="muted"><span className="agent-now-label">Next</span> {a.plan[a.planStep]}</div>}
+              </div>
+            )}
+            <FastLine fast={a.fast} />
+          </div>
+          {lastShot && <div className="agent-live-shot" title="Latest screenshot the agent saw"><StepShot key={lastShot} path={lastShot} alt="Latest screenshot the agent saw" onZoom={setBig} auto /></div>}
+        </div>
+        {running.map((t) => <ToolDrawer key={t.call_id} t={t} />)}
         {steps.length > 0 && (
           <ol className="agent-steps">
             {steps.map((s) => {
@@ -740,9 +798,30 @@ function AgentLive({ a }: { a: LiveAgent }) {
           </ol>
         )}
         {a.reasoning && <Thinking text={a.reasoning} live={thinking} />}
-        {a.text && <div className="agent-thought md"><MD text={a.text.replace(/```[\s\S]*?(```|$)/g, "").trim() || "Deciding the next action…"} /></div>}
       </div>
+      {big && <div className="lightbox" onClick={() => setBig(null)}><img src={big} alt="Screenshot" /></div>}
     </div>
+  );
+}
+
+/** Every recorded step of a finished task, opened from its message in the chat. */
+function TaskSteps({ taskId }: { taskId: string }) {
+  const [steps, setSteps] = useState<Step[] | null>(null);
+  const [open, setOpen] = useState(false);
+  const [big, setBig] = useState<string | null>(null);
+  useEffect(() => {
+    if (open && !steps) api.taskSteps(taskId).then(setSteps).catch(() => setSteps([]));
+  }, [open, steps, taskId]);
+  return (
+    <details className="drawer tool task-steps" onToggle={(e) => setOpen((e.target as HTMLDetailsElement).open)}>
+      <summary><ListChecks size={13} /> <span>Steps, tool calls and screenshots</span><ChevronDown size={13} className="chev" /></summary>
+      <div className="tool-body">
+        {!steps && <Spinner size={14} />}
+        {steps && steps.length === 0 && <span className="muted small">No steps were recorded.</span>}
+        {steps && <div className="timeline">{steps.map((s) => <StepRow key={s.id} s={s} onZoom={setBig} />)}</div>}
+      </div>
+      {big && <div className="lightbox" onClick={() => setBig(null)}><img src={big} alt="Screenshot" /></div>}
+    </details>
   );
 }
 
@@ -861,6 +940,7 @@ const MessageItem = memo(function MessageItem({ m, assistantName, isLastAssistan
           {reasoning && showReasoning && <Thinking text={reasoning} live={false} />}
           {m.meta?.tools?.map((t, i) => <ToolDrawer key={i} t={{ ...t, status: "done" }} />)}
           <div className="md"><MD text={body} /></div>
+          {isTask && m.meta?.task_id && <TaskSteps taskId={m.meta.task_id} />}
         </div>
       )}
       {editing === null && (

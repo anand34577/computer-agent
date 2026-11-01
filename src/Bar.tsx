@@ -1,6 +1,9 @@
 import { useEffect, useLayoutEffect, useRef, useState, type ReactNode } from "react";
-import { Cloud, GripVertical, Hand, ListChecks, Lock, MessageCircleQuestion, Pause, Play, Plus, ShieldAlert, Square, Timer, X } from "lucide-react";
-import { api, money, on, type AgentState, type Prompt, type Settings } from "./api";
+import { ChevronDown, ChevronUp, Cloud, GripVertical, Hand, ListChecks, Lock, MessageCircleQuestion, Pause, Play, Plus, ShieldAlert, Square, Timer, X } from "lucide-react";
+import { api, money, on, type AgentState, type Prompt, type Settings, type ToolEvent } from "./api";
+import { FastLine, PlanList } from "./components/AgentParts";
+
+const OPEN_KEY = "bar-details-open";
 import { applyTheme } from "./theme";
 
 /** Always-on-top floating bar shown while the agent operates the computer. */
@@ -9,6 +12,16 @@ export default function Bar() {
   const [prompt, setPrompt] = useState<Prompt | null>(null);
   const [paused, setPaused] = useState<string | null>(null);
   const [stopKey, setStopKey] = useState("Ctrl+Shift+F12");
+  const [running, setRunning] = useState<(ToolEvent & { started: number })[]>([]);
+  const [open, setOpen] = useState(() => {
+    try { return localStorage.getItem(OPEN_KEY) !== "0"; } catch { return true; }
+  });
+  const toggle = () => {
+    setOpen((o) => {
+      try { localStorage.setItem(OPEN_KEY, o ? "0" : "1"); } catch { /* per-viewer convenience only */ }
+      return !o;
+    });
+  };
   const ref = useRef<HTMLDivElement>(null);
 
   useEffect(() => {
@@ -31,7 +44,11 @@ export default function Bar() {
       on("agent-finished", () => {
         setPrompt(null);
         setPaused(null);
+        setRunning([]);
       }),
+      on<ToolEvent>("agent-tool", (t) =>
+        setRunning((r) => (t.status === "running" ? [...r.filter((x) => x.call_id !== t.call_id), { ...t, started: Date.now() }] : r.filter((x) => x.call_id !== t.call_id))),
+      ),
       on<Settings>("settings-changed", (s) => {
         applyTheme(s);
         setStopKey(s.stop_shortcut);
@@ -55,6 +72,8 @@ export default function Bar() {
   };
 
   const status = paused ? "paused" : state?.status ?? "starting";
+  const plan = state?.plan ?? [];
+  const hasDetails = plan.length > 0 || !!state?.thought || running.length > 0;
   const busy = ["observing", "thinking", "acting", "planning", "starting", "running"].includes(status);
 
   return (
@@ -76,10 +95,29 @@ export default function Bar() {
         ) : (
           <button className="icon-btn" onClick={() => api.agentPause()} title="Pause after the current action" aria-label="Pause"><Pause size={16} /></button>
         )}
+        {hasDetails && (
+          <button className="icon-btn" onClick={toggle} title={open ? "Hide plan and reasoning" : "Show plan and reasoning"} aria-label={open ? "Hide details" : "Show details"} aria-expanded={open}>
+            {open ? <ChevronUp size={16} /> : <ChevronDown size={16} />}
+          </button>
+        )}
         <button className="bar-stop" onClick={() => api.agentStop()} title={`Emergency stop (${stopKey}). Moving the pointer into the top-left corner pauses.`}>
           <Square size={13} fill="currentColor" /> Stop
         </button>
       </div>
+      {!prompt && open && hasDetails && (
+        <div className="bar-details">
+          {plan.length > 0 && <PlanList plan={plan} current={state?.plan_step ?? 0} compact />}
+          {state?.thought && <div className="bar-why"><span className="agent-now-label">Why</span> {state.thought}</div>}
+          <FastLine fast={state?.fast} />
+          {running.map((t) => (
+            <div key={t.call_id} className="bar-tool">
+              <span className="dot pulse" />
+              <span className="grow ellipsis" title={t.title || t.name}>{t.title || t.name}</span>
+              <button className="btn sm" onClick={() => api.cancelTool(t.call_id)} title="Cancel this action only; the task carries on"><X size={12} /> Cancel</button>
+            </div>
+          ))}
+        </div>
+      )}
       {prompt && <PromptPanel prompt={prompt} respond={respond} />}
     </div>
   );

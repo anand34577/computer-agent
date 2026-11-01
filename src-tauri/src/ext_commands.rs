@@ -33,7 +33,8 @@ pub fn create_plugin(sh: State<'_, Shared>, name: String) -> R<String> {
 
 #[tauri::command]
 pub fn import_plugin(sh: State<'_, Shared>, path: String) -> R<String> {
-    crate::plugins::import(&sh.data_dir, std::path::Path::new(path.trim().trim_matches('"'))).map_err(e)
+    let p = crate::commands::granted(&sh, &path)?;
+    crate::plugins::import(&sh.data_dir, &p).map_err(e)
 }
 
 #[tauri::command]
@@ -290,8 +291,9 @@ pub fn data_dir(sh: State<'_, Shared>) -> String {
 
 /// Reads a small JSON file the user picked (settings import).
 #[tauri::command]
-pub fn read_text_file(path: String) -> R<String> {
-    let p = std::path::Path::new(&path);
+pub fn read_text_file(sh: State<'_, Shared>, path: String) -> R<String> {
+    let p = crate::commands::granted(&sh, &path)?;
+    let p = p.as_path();
     if p.extension().and_then(|x| x.to_str()).map(|x| x.eq_ignore_ascii_case("json")) != Some(true) {
         return Err("Choose a .json file".into());
     }
@@ -300,6 +302,113 @@ pub fn read_text_file(path: String) -> R<String> {
         return Err("That file is too large to be a settings export".into());
     }
     std::fs::read_to_string(p).map_err(e)
+}
+
+// ---------- Fast decision model ----------
+
+fn decider() -> R<std::sync::Arc<crate::decision::Decider>> {
+    crate::decision::global().ok_or_else(|| "The decision model is not ready".to_string())
+}
+
+#[tauri::command]
+pub fn decision_status(sh: State<'_, Shared>) -> R<Value> {
+    Ok(decider()?.status(&crate::settings::load(&sh.db)))
+}
+
+/// Downloads and installs what the chosen backend needs, in the background; progress arrives as
+/// `decision-log` lines and a final `decision-status`.
+#[tauri::command]
+pub fn decision_setup(sh: State<'_, Shared>, gpu: bool) -> R<()> {
+    let d = decider()?;
+    let s = crate::settings::load(&sh.db);
+    crate::audit::log(&sh.db, "decision.setup", &s.decision.backend, json!({"gpu": gpu}));
+    tauri::async_runtime::spawn(async move {
+        let _ = d.setup(s, gpu).await;
+    });
+    Ok(())
+}
+
+#[tauri::command]
+pub async fn decision_start(sh: State<'_, Shared>) -> R<Value> {
+    let d = decider()?;
+    let s = crate::settings::load(&sh.db);
+    d.clone().start(&s).await.map_err(|e| e.to_string())?;
+    Ok(d.status(&s))
+}
+
+#[tauri::command]
+pub fn decision_stop(sh: State<'_, Shared>) -> R<Value> {
+    let d = decider()?;
+    d.stop();
+    Ok(d.status(&crate::settings::load(&sh.db)))
+}
+
+#[tauri::command]
+pub fn decision_delete_model(sh: State<'_, Shared>) -> R<Value> {
+    let d = decider()?;
+    let s = crate::settings::load(&sh.db);
+    d.delete_model(&s).map_err(|e| e.to_string())?;
+    crate::audit::log(&sh.db, "decision.delete_model", &s.decision.backend, json!({}));
+    Ok(d.status(&s))
+}
+
+#[derive(serde::Deserialize)]
+pub struct TryQuestion {
+    name: String,
+    instructions: String,
+    /// None for a yes/no question.
+    options: Option<Vec<String>>,
+}
+
+/// The "Try it" panel: your own questions about the screen, after an optional delay so you can
+/// bring another window to the front.
+#[tauri::command]
+pub async fn decision_try(sh: State<'_, Shared>, questions: Vec<TryQuestion>, context: String, delay_secs: u64) -> R<Value> {
+    use crate::decision::Q;
+    if questions.is_empty() || questions.len() > 16 {
+        return Err("Ask 1 to 16 questions".into());
+    }
+    let qs: Vec<Q> = questions
+        .into_iter()
+        .map(|q| Q {
+            name: q.name.chars().filter(|c| c.is_alphanumeric() || *c == '_').take(40).collect(),
+            instructions: q.instructions.chars().take(500).collect(),
+            options: q.options.map(|o| o.into_iter().filter(|x| !x.trim().is_empty()).take(62).map(|x| (x.trim().chars().take(80).collect(), x.trim().chars().take(200).collect())).collect()),
+        })
+        .collect();
+    if qs.iter().any(|q| q.name.is_empty() || q.options.as_ref().map(|o| o.len() < 2).unwrap_or(false)) {
+        return Err("Each question needs a name, and a choice needs at least two options".into());
+    }
+    if delay_secs > 0 {
+        tokio::time::sleep(std::time::Duration::from_secs(delay_secs.min(10))).await;
+    }
+    let cfg = crate::settings::load(&sh.db).decision;
+    let shot = tauri::async_runtime::spawn_blocking(crate::screen::capture).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let prepared = crate::screen::prepare(&shot, &[], crate::decision::IMAGE_WIDTH, false, false, &[]);
+    let image = prepared.b64.clone();
+    let t0 = std::time::Instant::now();
+    let state = if context.trim().is_empty() { json!("The screenshot shows the user's screen.") } else { json!({"context": context.chars().take(4000).collect::<String>()}) };
+    let v = crate::decision::predict(&sh.http, &cfg, state, &qs, Some(image.clone()), std::time::Duration::from_secs(120)).await.map_err(|e| e.to_string())?;
+    Ok(json!({"ms": t0.elapsed().as_millis() as u64, "answers": v["answers"], "image": image}))
+}
+
+/// Asks the model about the current screen, to check it works and how fast it is.
+#[tauri::command]
+pub async fn decision_test(sh: State<'_, Shared>) -> R<Value> {
+    use crate::decision::Q;
+    let cfg = crate::settings::load(&sh.db).decision;
+    let shot = tauri::async_runtime::spawn_blocking(crate::screen::capture).await.map_err(|e| e.to_string())?.map_err(|e| e.to_string())?;
+    let prepared = crate::screen::prepare(&shot, &[], crate::decision::IMAGE_WIDTH, false, false, &[]);
+    let qs = [
+        Q::yes_no("loading", "Is the screen still loading or changing?"),
+        Q::choice("kind", "What is mainly shown?", &[("browser", "A web browser"), ("editor", "A code or text editor"), ("chat", "A chat or messaging app"), ("desktop", "The desktop or file explorer"), ("other", "Something else")]),
+    ];
+    let t0 = std::time::Instant::now();
+    let v = crate::decision::predict(&sh.http, &cfg, json!({"note": "Connection test from Computer Agent"}), &qs, Some(prepared.b64), std::time::Duration::from_secs(120))
+        .await
+        .map_err(|e| e.to_string())?;
+    let ms = t0.elapsed().as_millis() as u64;
+    Ok(json!({"ms": ms, "server_ms": v["timing"]["inference_ms"], "answers": v["answers"], "model": v["model"]}))
 }
 
 // ---------- Built-in llama.cpp engine ----------
@@ -504,23 +613,15 @@ pub fn llama_log() -> R<String> {
 
 // ---------------- Documents, embeddings, devices, stats ----------------
 
-/// Attaches a document to a chat, from a path or from base64 data.
+/// Attaches a document to a chat from the file's base64 data (read by the page from a file the user chose).
 #[tauri::command]
-pub async fn docs_add(sh: State<'_, Shared>, conversation_id: String, name: String, mode: String, path: Option<String>, data: Option<String>) -> R<Value> {
+pub async fn docs_add(sh: State<'_, Shared>, conversation_id: String, name: String, mode: String, data: Option<String>) -> R<Value> {
     use base64::Engine;
-    let (name, bytes) = match (path, data) {
-        (Some(p), _) if !p.trim().is_empty() => {
-            let pb = std::path::PathBuf::from(p.trim());
-            let meta = std::fs::metadata(&pb).map_err(|_| "File: not found".to_string())?;
-            if meta.len() as usize > crate::docs::MAX_DOC_BYTES {
-                return Err("File: larger than 25 MB".into());
-            }
-            let n = pb.file_name().map(|x| x.to_string_lossy().to_string()).unwrap_or(name);
-            (n, std::fs::read(&pb).map_err(e)?)
-        }
-        (_, Some(d)) => (name, base64::engine::general_purpose::STANDARD.decode(d.as_bytes()).map_err(|_| "File: could not be read".to_string())?),
-        _ => return Err("File: choose a document".into()),
-    };
+    let Some(d) = data else { return Err("File: choose a document".into()) };
+    let bytes = base64::engine::general_purpose::STANDARD.decode(d.as_bytes()).map_err(|_| "File: could not be read".to_string())?;
+    if bytes.len() > crate::docs::MAX_DOC_BYTES {
+        return Err("File: larger than 25 MB".into());
+    }
     let name: String = name.chars().filter(|c| !c.is_control()).take(200).collect();
     if !crate::docs::supported(&name) {
         return Err(format!("{name}: this file type is not supported. Use PDF, Word, PowerPoint, Excel, text, Markdown, CSV, JSON or code files."));
@@ -580,7 +681,7 @@ pub async fn llama_fetch_embed(app: AppHandle, sh: State<'_, Shared>, id: String
 #[tauri::command]
 pub fn stats(sh: State<'_, Shared>, days: u32) -> R<Value> {
     let since = if days == 0 { 0 } else { crate::db::now() - days as i64 * 86_400_000 };
-    let conn = sh.db.conn.lock();
+    let conn = sh.db.read.lock();
     let one = |sql: &str| -> i64 { conn.query_row(sql, [since], |r| r.get(0)).unwrap_or(0) };
     let totals = conn
         .query_row(

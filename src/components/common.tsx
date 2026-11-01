@@ -5,14 +5,15 @@ import type { Model, Settings } from "../api";
 
 /* ---------- App context ---------- */
 
-export type Toast = { id: number; text: string; kind?: "ok" | "bad" | "info" };
+export type ToastAction = { label: string; run: () => void };
+export type Toast = { id: number; text: string; kind?: "ok" | "bad" | "info"; action?: ToastAction };
 
 export type AppCtx = {
   settings: Settings;
   setSettings: (s: Settings) => Promise<boolean>;
   models: Model[];
   refreshModels: () => Promise<void>;
-  toast: (text: string, kind?: Toast["kind"]) => void;
+  toast: (text: string, kind?: Toast["kind"], action?: ToastAction) => void;
 };
 
 export const Ctx = createContext<AppCtx>(null as unknown as AppCtx);
@@ -469,20 +470,53 @@ export function Seg<T extends string>({ value, options, onChange, label }: { val
 
 /* ---------- Surfaces ---------- */
 
+/** Open dialogs, newest last: only the top one answers Escape and keeps focus. */
+const modalStack: symbol[] = [];
+const FOCUSABLE = 'a[href], button:not([disabled]), input:not([disabled]), textarea:not([disabled]), select:not([disabled]), [tabindex]:not([tabindex="-1"])';
+
 export function Modal({ title, subtitle, icon: Icon, children, onClose, footer, wide }: { title: ReactNode; subtitle?: ReactNode; icon?: LucideIcon; children: ReactNode; onClose: () => void; footer?: ReactNode; wide?: boolean }) {
+  const box = useRef<HTMLDivElement>(null);
+  const close = useRef(onClose);
+  close.current = onClose;
+  const titleId = useMemo(() => "dlg-" + Math.random().toString(36).slice(2), []);
   useEffect(() => {
-    const h = (e: KeyboardEvent) => e.key === "Escape" && onClose();
-    window.addEventListener("keydown", h);
-    return () => window.removeEventListener("keydown", h);
-  }, [onClose]);
+    const me = Symbol();
+    modalStack.push(me);
+    const before = document.activeElement as HTMLElement | null;
+    // Focus the first field, or else the first button in the footer, or the dialog itself.
+    const el = box.current;
+    const first = el?.querySelector<HTMLElement>(".modal-body input, .modal-body textarea, .modal-foot .btn.primary, .modal-foot .btn") ?? el;
+    first?.focus();
+    const h = (e: KeyboardEvent) => {
+      if (modalStack[modalStack.length - 1] !== me || !box.current) return;
+      if (e.key === "Escape") {
+        e.stopPropagation();
+        close.current();
+      } else if (e.key === "Tab") {
+        // Keep Tab inside the dialog.
+        const items = Array.from(box.current.querySelectorAll<HTMLElement>(FOCUSABLE)).filter((x) => x.offsetParent !== null);
+        if (!items.length) return;
+        const [a, z] = [items[0], items[items.length - 1]];
+        if (e.shiftKey && (document.activeElement === a || !box.current.contains(document.activeElement))) { e.preventDefault(); z.focus(); }
+        else if (!e.shiftKey && (document.activeElement === z || !box.current.contains(document.activeElement))) { e.preventDefault(); a.focus(); }
+      }
+    };
+    window.addEventListener("keydown", h, true);
+    return () => {
+      window.removeEventListener("keydown", h, true);
+      modalStack.splice(modalStack.indexOf(me), 1);
+      // Return focus to whatever opened the dialog.
+      if (before && document.contains(before)) before.focus();
+    };
+  }, []);
   // Rendered at the top level so no scrolling or animated container can clip it.
   return createPortal(
     <div className="modal-bg" onMouseDown={(e) => e.target === e.currentTarget && onClose()}>
-      <div className={"modal" + (wide ? " wide" : "")} role="dialog" aria-modal="true">
+      <div ref={box} tabIndex={-1} className={"modal" + (wide ? " wide" : "")} role="dialog" aria-modal="true" aria-labelledby={titleId}>
         <div className="modal-head">
           {Icon && <div className="card-icon"><Icon size={17} /></div>}
           <div className="grow">
-            <h2>{title}</h2>
+            <h2 id={titleId}>{title}</h2>
             {subtitle && <p>{subtitle}</p>}
           </div>
           <button className="icon-btn" onClick={onClose} aria-label="Close"><X size={16} /></button>
@@ -578,6 +612,7 @@ export function Toasts({ toasts }: { toasts: Toast[] }) {
           <div key={t.id} className={"toast " + (t.kind ?? "")}>
             <I size={16} className="icon" />
             <div>{t.text}</div>
+            {t.action && <button className="btn sm toast-action" onClick={t.action.run}>{t.action.label}</button>}
           </div>
         );
       })}

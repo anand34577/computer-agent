@@ -59,8 +59,36 @@ pub struct Shared {
     pub agent: Arc<AgentControl>,
     pub a11y: Arc<Worker>,
     pub chat_cancels: Arc<Mutex<HashMap<String, Arc<Notify>>>>,
+    /// Tool calls running right now (chat and agent), each cancellable on its own.
+    pub tool_cancels: Arc<ToolCancels>,
     pub mcp: Arc<crate::mcp::Manager>,
     pub vm: Arc<crate::microvm::Vm>,
+    /// Paths the user picked in a native dialog; the only ones file import/export commands accept.
+    pub granted: Arc<Mutex<std::collections::HashSet<PathBuf>>>,
+}
+
+#[derive(Default)]
+pub struct ToolCancels(Mutex<HashMap<String, Arc<Notify>>>);
+
+impl ToolCancels {
+    pub fn register(&self, id: &str) -> Arc<Notify> {
+        let n = Arc::new(Notify::new());
+        self.0.lock().insert(id.to_string(), n.clone());
+        n
+    }
+    pub fn remove(&self, id: &str) {
+        self.0.lock().remove(id);
+    }
+    /// Returns false when the call already finished.
+    pub fn cancel(&self, id: &str) -> bool {
+        match self.0.lock().get(id) {
+            Some(n) => {
+                n.notify_one();
+                true
+            }
+            None => false,
+        }
+    }
 }
 
 impl Shared {

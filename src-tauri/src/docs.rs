@@ -68,7 +68,7 @@ pub fn extract_text(name: &str, bytes: &[u8]) -> Result<String> {
 
 fn office_text(bytes: &[u8], want: impl Fn(&str) -> bool) -> Result<String> {
     let mut z = zip::ZipArchive::new(std::io::Cursor::new(bytes)).map_err(|_| anyhow!("The file is not a valid Office document"))?;
-    let mut names: Vec<String> = z.file_names().filter(|n| want(n)).map(String::from).collect();
+    let mut names: Vec<String> = z.file_names().filter_map(|n| n.ok().map(|n| n.into_owned())).filter(|n| want(n)).collect();
     names.sort_by_key(|n| (n.len(), n.clone()));
     let mut out = String::new();
     for n in names {
@@ -205,7 +205,7 @@ fn to_blob(v: &[f32]) -> Vec<u8> {
 }
 
 fn from_blob(b: &[u8]) -> Vec<f32> {
-    b.chunks_exact(4).map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
+    b.as_chunks::<4>().0.iter().map(|c| f32::from_le_bytes([c[0], c[1], c[2], c[3]])).collect()
 }
 
 fn dot(a: &[f32], b: &[f32]) -> f32 {

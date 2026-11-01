@@ -273,8 +273,8 @@ pub fn gguf_info(path: &Path) -> Result<GgufInfo> {
         let fixed = match ty {
             0 | 1 | 7 => 1,
             2 | 3 => 2,
-            4 | 5 | 6 => 4,
-            10 | 11 | 12 => 8,
+            4..=6 => 4,
+            10..=12 => 8,
             _ => 0,
         };
         if fixed > 0 {
@@ -300,8 +300,8 @@ pub fn gguf_info(path: &Path) -> Result<GgufInfo> {
                 let width = match inner {
                     0 | 1 | 7 => 1,
                     2 | 3 => 2,
-                    4 | 5 | 6 => 4,
-                    10 | 11 | 12 => 8,
+                    4..=6 => 4,
+                    10..=12 => 8,
                     _ => 0,
                 };
                 if width > 0 {
@@ -500,6 +500,13 @@ impl Llama {
             embed_current: self.embed.lock().as_ref().map(|x| x.alias.clone()),
             embed_state: self.embed_state.lock().clone(),
         }
+    }
+
+    /// The installed llama-server and whether it is a GPU build, for other servers the app runs.
+    pub fn server_exe(&self) -> Option<(PathBuf, bool)> {
+        let exe = find_exe(&self.dir().join("bin"))?;
+        let gpu = self.installed_variant().and_then(|v| variant(&v).map(|x| x.gpu)).unwrap_or(false);
+        Some((exe, gpu))
     }
 
     /// Devices this build can offload to. Cached until the build changes.

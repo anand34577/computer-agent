@@ -250,8 +250,8 @@ pub async fn ollama_unload(sh: State<'_, Shared>, base_url: String, name: String
 // ---------- Chat ----------
 
 #[tauri::command]
-pub fn list_conversations(sh: State<'_, Shared>, query: String) -> R<Vec<Value>> {
-    chat::list_conversations(&sh, &query).map_err(e)
+pub fn list_conversations(sh: State<'_, Shared>, query: String, limit: Option<u32>) -> R<Value> {
+    chat::list_conversations(&sh, &query, limit.unwrap_or(40)).map_err(e)
 }
 
 #[tauri::command]
@@ -304,10 +304,51 @@ pub fn fork_conversation(sh: State<'_, Shared>, id: String) -> R<String> {
     Ok(new)
 }
 
+/// Native file dialogs. A path chosen here is the only kind the save and import commands accept,
+/// so a page that misbehaves cannot read or write files the user never picked.
+#[tauri::command]
+#[allow(clippy::too_many_arguments)]
+pub async fn pick_path(app: AppHandle, sh: State<'_, Shared>, mode: String, title: Option<String>, filter_name: Option<String>, extensions: Option<Vec<String>>, default_name: Option<String>) -> R<Option<String>> {
+    use tauri_plugin_dialog::DialogExt;
+    let mut d = app.dialog().file();
+    if let Some(t) = title {
+        d = d.set_title(t);
+    }
+    if let Some(exts) = extensions.filter(|x| !x.is_empty()) {
+        let refs: Vec<&str> = exts.iter().map(String::as_str).collect();
+        d = d.add_filter(filter_name.unwrap_or_else(|| "Files".into()), &refs);
+    }
+    if let Some(n) = default_name {
+        d = d.set_file_name(n);
+    }
+    let picked = tokio::task::spawn_blocking(move || match mode.as_str() {
+        "save" => d.blocking_save_file(),
+        "folder" => d.blocking_pick_folder(),
+        _ => d.blocking_pick_file(),
+    })
+    .await
+    .map_err(e)?;
+    let Some(fp) = picked else { return Ok(None) };
+    let p = fp.into_path().map_err(e)?;
+    sh.granted.lock().insert(p.clone());
+    Ok(Some(p.to_string_lossy().to_string()))
+}
+
+/// The path, if the user picked it in a dialog this session.
+pub fn granted(sh: &Shared, path: &str) -> R<std::path::PathBuf> {
+    let p = std::path::PathBuf::from(path.trim().trim_matches('"'));
+    if sh.granted.lock().contains(&p) {
+        Ok(p)
+    } else {
+        Err("Choose the file in the file dialog first".into())
+    }
+}
+
 /// Writes an export the user chose a location for in the save dialog.
 #[tauri::command]
-pub fn save_text_file(path: String, content: String) -> R<()> {
-    let p = std::path::Path::new(&path);
+pub fn save_text_file(sh: State<'_, Shared>, path: String, content: String) -> R<()> {
+    let p = granted(&sh, &path)?;
+    let p = p.as_path();
     let ext = p.extension().and_then(|x| x.to_str()).unwrap_or("").to_lowercase();
     if !["md", "json", "txt", "csv", "html"].contains(&ext.as_str()) {
         return Err("Exports can be saved as .md, .json, .txt, .csv or .html".into());
@@ -341,9 +382,26 @@ pub fn branch_conversation(sh: State<'_, Shared>, id: String, message_id: String
     chat::branch(&sh, &id, &message_id).map_err(e)
 }
 
-fn spawn_reply(app: AppHandle, sh: Shared, conv: String, model_id: String, think: Option<bool>) {
+/// Claims the conversation for one reply at a time; Stop finds the reply through this handle.
+fn reserve(sh: &Shared, conv: &str) -> R<std::sync::Arc<tokio::sync::Notify>> {
+    let mut m = sh.chat_cancels.lock();
+    if m.contains_key(conv) {
+        return Err("A reply is still being written in this chat. Stop it or wait for it to finish.".into());
+    }
+    let n = std::sync::Arc::new(tokio::sync::Notify::new());
+    m.insert(conv.to_string(), n.clone());
+    Ok(n)
+}
+
+/// Runs the reply in the background. Any failure the reply did not report itself (for example a
+/// model that was removed) still reaches the interface, so it never waits forever.
+fn spawn_reply(app: AppHandle, sh: Shared, conv: String, model_id: String, think: Option<bool>, cancel: std::sync::Arc<tokio::sync::Notify>) {
     tauri::async_runtime::spawn(async move {
-        let _ = chat::respond(app, sh, conv, model_id, think).await;
+        let r = chat::respond(app.clone(), sh.clone(), conv.clone(), model_id, think, cancel).await;
+        sh.chat_cancels.lock().remove(&conv);
+        if let Err(err) = r {
+            let _ = app.emit("chat-error", json!({"conversation_id": conv, "error": chat::friendly_error(&err.to_string()), "fallback": null}));
+        }
     });
 }
 
@@ -354,16 +412,27 @@ pub fn send_message(app: AppHandle, sh: State<'_, Shared>, conversation_id: Stri
     if docs.len() > 20 {
         return Err("Attach up to 20 documents per message".into());
     }
-    let id = chat::add_user_message(&sh, &conversation_id, &content, &images, &docs).map_err(e)?;
-    chat::update_conversation(&sh, &conversation_id, &json!({"model_id": model_id})).map_err(e)?;
-    spawn_reply(app, sh.inner().clone(), conversation_id, model_id, think);
+    let cancel = reserve(&sh, &conversation_id)?;
+    let added = chat::add_user_message(&sh, &conversation_id, &content, &images, &docs).and_then(|id| chat::update_conversation(&sh, &conversation_id, &json!({"model_id": model_id})).map(|_| id));
+    let id = match added {
+        Ok(id) => id,
+        Err(x) => {
+            sh.chat_cancels.lock().remove(&conversation_id);
+            return Err(e(x));
+        }
+    };
+    spawn_reply(app, sh.inner().clone(), conversation_id, model_id, think, cancel);
     Ok(id)
 }
 
 #[tauri::command]
 pub fn regenerate(app: AppHandle, sh: State<'_, Shared>, conversation_id: String, message_id: String, model_id: String, think: Option<bool>) -> R<()> {
-    chat::truncate_from(&sh, &conversation_id, &message_id).map_err(e)?;
-    spawn_reply(app, sh.inner().clone(), conversation_id, model_id, think);
+    let cancel = reserve(&sh, &conversation_id)?;
+    if let Err(x) = chat::truncate_from(&sh, &conversation_id, &message_id) {
+        sh.chat_cancels.lock().remove(&conversation_id);
+        return Err(e(x));
+    }
+    spawn_reply(app, sh.inner().clone(), conversation_id, model_id, think, cancel);
     Ok(())
 }
 
@@ -373,9 +442,12 @@ pub fn edit_and_resend(app: AppHandle, sh: State<'_, Shared>, conversation_id: S
     let old = conv["messages"].as_array().and_then(|a| a.iter().find(|m| m["id"] == message_id.as_str())).cloned().unwrap_or(json!({}));
     let images: Vec<Attachment> = serde_json::from_value(old["images"].clone()).unwrap_or_default();
     let docs: Vec<Value> = old["meta"]["docs"].as_array().cloned().unwrap_or_default();
-    chat::truncate_from(&sh, &conversation_id, &message_id).map_err(e)?;
-    chat::add_user_message(&sh, &conversation_id, &content, &images, &docs).map_err(e)?;
-    spawn_reply(app, sh.inner().clone(), conversation_id, model_id, think);
+    let cancel = reserve(&sh, &conversation_id)?;
+    if let Err(x) = chat::truncate_from(&sh, &conversation_id, &message_id).and_then(|_| chat::add_user_message(&sh, &conversation_id, &content, &images, &docs)) {
+        sh.chat_cancels.lock().remove(&conversation_id);
+        return Err(e(x));
+    }
+    spawn_reply(app, sh.inner().clone(), conversation_id, model_id, think, cancel);
     Ok(())
 }
 
@@ -446,6 +518,16 @@ pub fn resume_task(app: AppHandle, sh: State<'_, Shared>, task_id: String) -> R<
 #[tauri::command]
 pub fn agent_stop(app: AppHandle) {
     crate::state::emergency_stop(&app);
+}
+
+/// Cancels one running tool call (chat or agent); the reply or task carries on without it.
+#[tauri::command]
+pub fn cancel_tool(sh: State<'_, Shared>, call_id: String) -> R<bool> {
+    let ok = sh.tool_cancels.cancel(&call_id);
+    if ok {
+        crate::audit::log(&sh.db, "tool.cancel", &call_id, json!({}));
+    }
+    Ok(ok)
 }
 
 #[tauri::command]
@@ -529,8 +611,8 @@ pub fn get_task_steps(sh: State<'_, Shared>, id: String, query: Option<String>) 
 
 #[tauri::command]
 pub fn read_screenshot(sh: State<'_, Shared>, path: String) -> R<String> {
-    let p = std::path::PathBuf::from(&path);
-    if !p.starts_with(sh.shots_dir()) {
+    let p = crate::files::resolve(std::path::Path::new(&path)).map_err(|_| "Not an agent screenshot".to_string())?;
+    if !crate::files::within(&p, &sh.shots_dir()) || p.extension().map(|x| x != "jpg").unwrap_or(true) {
         return Err("Not an agent screenshot".into());
     }
     let bytes = std::fs::read(p).map_err(|_| "Screenshot no longer available".to_string())?;
@@ -544,6 +626,9 @@ pub fn undo_task(sh: State<'_, Shared>, id: String) -> R<Value> {
 
 #[tauri::command]
 pub fn delete_task(sh: State<'_, Shared>, id: String) -> R<()> {
+    if !is_id(&id) {
+        return Err("Task not found".into());
+    }
     let conn = sh.db.conn.lock();
     conn.execute("DELETE FROM steps WHERE task_id=?1", [&id]).map_err(e)?;
     conn.execute("DELETE FROM tasks WHERE id=?1", [&id]).map_err(e)?;
@@ -557,9 +642,14 @@ pub fn export_task(sh: State<'_, Shared>, id: String) -> R<String> {
     let steps = get_task_steps(sh.clone(), id.clone(), None)?;
     let task: Value = list_tasks(sh.clone())?.into_iter().find(|t| t["id"] == id.as_str()).unwrap_or(json!({}));
     let out = json!({"task": task, "steps": steps});
-    let path = dirs::download_dir().unwrap_or_else(std::env::temp_dir).join(format!("agent-task-{}.json", &id[..8]));
+    let path = dirs::download_dir().unwrap_or_else(std::env::temp_dir).join(format!("agent-task-{}.json", id.chars().filter(|c| c.is_ascii_alphanumeric()).take(8).collect::<String>()));
     std::fs::write(&path, serde_json::to_string_pretty(&out).map_err(e)?).map_err(e)?;
     Ok(path.to_string_lossy().to_string())
+}
+
+/// Ids are generated UUIDs; anything else (such as "..") never reaches a file path.
+fn is_id(id: &str) -> bool {
+    !id.is_empty() && id.len() <= 64 && id.chars().all(|c| c.is_ascii_alphanumeric() || c == '-')
 }
 
 // ---------- Playbooks (saved tasks) ----------
@@ -619,16 +709,38 @@ pub fn delete_playbook(sh: State<'_, Shared>, id: String) -> R<()> {
 // ---------- Privacy, platform, diagnostics ----------
 
 #[tauri::command]
-pub fn wipe_all_data(sh: State<'_, Shared>) -> R<()> {
+/// Deletes chats, documents, task logs, statistics, playbooks, screenshots, the undo area and the
+/// database backups. With `include_audit`, the audit trail goes too (it restarts with one record of
+/// the wipe). Models, providers, keys and settings are kept.
+pub fn wipe_all_data(sh: State<'_, Shared>, include_audit: Option<bool>) -> R<()> {
+    let include_audit = include_audit.unwrap_or(false);
     {
         let conn = sh.db.conn.lock();
-        for t in ["messages", "conversations", "steps", "tasks", "undo_ops", "usage"] {
+        let mut tables = vec!["chunks", "documents", "messages", "conversations", "steps", "tasks", "undo_ops", "usage", "replies"];
+        if include_audit {
+            tables.push("audit");
+        }
+        for t in tables {
             conn.execute(&format!("DELETE FROM {t}"), []).map_err(e)?;
         }
-        conn.execute_batch("VACUUM").map_err(e)?;
+        conn.execute("DELETE FROM settings WHERE key='playbooks'", []).map_err(e)?;
+    }
+    crate::audit::log(&sh.db, "data.wipe", if include_audit { "everything, including the audit trail" } else { "chats, documents and task data" }, json!({}));
+    {
+        let conn = sh.db.conn.lock();
+        // Rewrite the file so deleted text does not linger in free pages or the write-ahead log.
+        conn.execute_batch("VACUUM; PRAGMA wal_checkpoint(TRUNCATE);").map_err(e)?;
     }
     let _ = std::fs::remove_dir_all(sh.shots_dir());
     let _ = std::fs::remove_dir_all(sh.holding_dir());
+    if let Ok(rd) = std::fs::read_dir(&sh.data_dir) {
+        for f in rd.flatten() {
+            let n = f.file_name().to_string_lossy().to_string();
+            if n.starts_with("agent.") && n.ends_with(".bak") {
+                let _ = std::fs::remove_file(f.path());
+            }
+        }
+    }
     Ok(())
 }
 

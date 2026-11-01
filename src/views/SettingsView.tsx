@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useState } from "react";
-import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   Archive, Bot, Check, CircleAlert, CircleCheck, DollarSign, Download, FolderLock, FolderOpen, FolderPlus, Gauge, Info, Keyboard, Lock, Monitor, MousePointer2,
@@ -305,6 +304,7 @@ function Privacy() {
   const patch = usePatch();
   const [diag, setDiag] = useState<string | null>(null);
   const [wipe, setWipe] = useState(false);
+  const [wipeAudit, setWipeAudit] = useState(false);
   return (
     <>
       <Card title="Privacy">
@@ -332,8 +332,10 @@ function Privacy() {
         </Modal>
       )}
       {wipe && (
-        <ConfirmDialog title="Wipe all data?" confirmLabel="Wipe everything" onClose={() => setWipe(false)} onConfirm={async () => { try { await api.wipeAll(); toast("All data wiped", "ok"); } catch (e) { toast(errText(e), "bad"); } }}>
-          This deletes every chat, task log, screenshot and the undo area. Models, providers and settings are kept. This cannot be undone.
+        <ConfirmDialog title="Wipe all data?" confirmLabel="Wipe everything" onClose={() => { setWipe(false); setWipeAudit(false); }} onConfirm={async () => { try { await api.wipeAll(wipeAudit); toast("All data wiped", "ok"); } catch (e) { toast(errText(e), "bad"); } }}>
+          <p style={{ marginTop: 0 }}>This permanently deletes every chat and attached document, task logs, screenshots, the undo area, usage statistics, playbooks and database backups. Models, providers, API keys and settings are kept.</p>
+          <Checkbox checked={wipeAudit} onChange={setWipeAudit}>Also delete the audit log (it keeps a record of tool calls and commands, without message text)</Checkbox>
+          <p className="small muted" style={{ marginBottom: 0 }}>This cannot be undone.</p>
         </ConfirmDialog>
       )}
     </>
@@ -395,10 +397,10 @@ function Backup() {
   const { toast } = useApp();
   const [reset, setReset] = useState(false);
   const importFile = async () => {
-    const f = await open({ filters: [{ name: "Settings", extensions: ["json"] }], title: "Choose a settings export" });
+    const f = await api.pickPath("open", { filterName: "Settings", extensions: ["json"], title: "Choose a settings export" });
     if (typeof f !== "string") return;
     try {
-      const content = await readTextFile(f);
+      const content = await api.readTextFile(f);
       await api.importSettings(content);
       toast("Settings imported", "ok");
     } catch (e) {
@@ -420,11 +422,6 @@ function Backup() {
       {reset && <ConfirmDialog title="Reset all settings?" confirmLabel="Reset" onClose={() => setReset(false)} onConfirm={async () => { await api.resetSettings(); toast("Settings reset", "ok"); }}>Appearance, agent behaviour, permissions, shortcuts, MCP servers and the sandbox go back to their defaults.</ConfirmDialog>}
     </>
   );
-}
-
-/** Reads a text file the user picked through the dialog. */
-function readTextFile(path: string): Promise<string> {
-  return invoke<string>("read_text_file", { path });
 }
 
 function System() {

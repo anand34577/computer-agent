@@ -8,6 +8,9 @@ use std::path::Path;
 
 pub struct Db {
     pub conn: Mutex<Connection>,
+    /// A second, read-only connection for long reports (stats, audit search and export), so they
+    /// never hold up chat and agent writes. WAL mode lets it read while the other one writes.
+    pub read: Mutex<Connection>,
 }
 
 const MIGRATIONS: &[&str] = &[
@@ -109,8 +112,12 @@ impl Db {
         let target = MIGRATIONS.len() as i64;
         if version < target {
             if version > 0 {
+                // VACUUM INTO writes a consistent copy that includes what is still in the WAL file.
                 let backup = path.with_extension(format!("v{version}.bak"));
-                let _ = std::fs::copy(path, backup);
+                let _ = std::fs::remove_file(&backup);
+                if conn.execute("VACUUM INTO ?1", [backup.to_string_lossy()]).is_err() {
+                    let _ = std::fs::copy(path, &backup);
+                }
             }
             for (i, sql) in MIGRATIONS.iter().enumerate().skip(version as usize) {
                 let tx = conn.unchecked_transaction()?;
@@ -119,7 +126,8 @@ impl Db {
                 tx.commit()?;
             }
         }
-        Ok(Self { conn: Mutex::new(conn) })
+        let read = Connection::open_with_flags(path, rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX)?;
+        Ok(Self { conn: Mutex::new(conn), read: Mutex::new(read) })
     }
 }
 

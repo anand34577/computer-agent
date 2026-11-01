@@ -305,6 +305,18 @@ pub fn settings(s: &AppSettings, model_ids: &[String]) -> Problems {
         range(&mut p, "llama.repeat_penalty", t, 0.5, 2.0);
     }
     one_of(&mut p, "doc_mode", &s.doc_mode, &["ask", "embed", "direct"]);
+    one_of(&mut p, "decision.device", &s.decision.device, &["auto", "cuda", "cpu"]);
+    one_of(&mut p, "decision.backend", &s.decision.backend, &["gguf", "python"]);
+    range(&mut p, "decision.threshold", s.decision.threshold, 0.5, 0.99);
+    range(&mut p, "decision.budget_ms", s.decision.budget_ms, 100, 10_000);
+    if !(s.decision.url.starts_with("http://") || s.decision.url.starts_with("https://")) || reqwest::Url::parse(&s.decision.url).is_err() {
+        p.push(("decision.url".into(), "Enter an address such as http://127.0.0.1:47615".into()));
+    }
+    let repo = &s.decision.model_repo;
+    if repo.split('/').count() != 2 || !repo.chars().all(|c| c.is_ascii_alphanumeric() || "-_./".contains(c)) {
+        p.push(("decision.model_repo".into(), "Enter a Hugging Face repository such as internlm/Intern-Decision-0.8B".into()));
+    }
+    one_of(&mut p, "roles.locator_coords", &s.roles.locator_coords, &["auto", "pixels", "norm1000", "norm1"]);
     if let Some(e) = &s.embed_model {
         if !model_ids.contains(e) {
             p.push(("embed_model".into(), "That model no longer exists".into()));
@@ -319,7 +331,7 @@ pub fn settings(s: &AppSettings, model_ids: &[String]) -> Problems {
     if s.system_prompt.chars().count() > 8000 {
         p.push(("system_prompt".into(), "Keep instructions under 8000 characters".into()));
     }
-    for (f, id) in [("default_model", &s.default_model), ("fallback_model", &s.fallback_model), ("roles.planner", &s.roles.planner), ("roles.doer", &s.roles.doer), ("roles.eyes", &s.roles.eyes)] {
+    for (f, id) in [("default_model", &s.default_model), ("fallback_model", &s.fallback_model), ("roles.planner", &s.roles.planner), ("roles.doer", &s.roles.doer), ("roles.eyes", &s.roles.eyes), ("roles.locator", &s.roles.locator)] {
         if let Some(id) = id {
             if !model_ids.contains(id) {
                 p.push((f.into(), "That model no longer exists".into()));
@@ -372,10 +384,7 @@ mod tests {
 
     #[test]
     fn bad_settings_are_reported_per_field() {
-        let mut s = AppSettings::default();
-        s.max_steps = 0;
-        s.accent = "blue".into();
-        s.task_cost_cap = 50.0;
+        let s = AppSettings { max_steps: 0, accent: "blue".into(), task_cost_cap: 50.0, ..AppSettings::default() };
         let fields: Vec<String> = settings(&s, &[]).into_iter().map(|x| x.0).collect();
         assert!(fields.contains(&"max_steps".to_string()));
         assert!(fields.contains(&"accent".to_string()));

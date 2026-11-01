@@ -4,6 +4,7 @@ mod audit;
 mod chat;
 mod commands;
 mod db;
+mod decision;
 mod docs;
 mod subagents;
 mod ext_commands;
@@ -128,6 +129,15 @@ pub fn run() {
             let http = reqwest::Client::builder()
                 .connect_timeout(std::time::Duration::from_secs(10))
                 .timeout(std::time::Duration::from_secs(600))
+                // A public page must not redirect a tool into a cloud metadata service.
+                .redirect(reqwest::redirect::Policy::custom(|a| {
+                    let blocked = safety::network_risk(a.url().as_str()).map(|v| v.level == safety::Level::Blocked).unwrap_or(false);
+                    if blocked || a.previous().len() >= 10 {
+                        a.stop()
+                    } else {
+                        a.follow()
+                    }
+                }))
                 .build()?;
             let shared = Shared {
                 db: db.clone(),
@@ -136,11 +146,14 @@ pub fn run() {
                 agent: Arc::new(AgentControl::default()),
                 a11y: Arc::new(a11y::Worker::start()),
                 chat_cancels: Arc::new(Mutex::new(HashMap::new())),
+                tool_cancels: Arc::new(Default::default()),
                 mcp: Arc::new(mcp::Manager::default()),
                 vm: Arc::new(microvm::Vm::default()),
+                granted: Arc::default(),
             };
             shared.vm.init(app.handle().clone(), &data_dir);
             let llama = llamacpp::init(app.handle().clone(), db.clone(), shared.http.clone(), &data_dir);
+            decision::init(app.handle().clone(), &data_dir);
             let mut s = settings::load(&db);
             if models::heal_model_refs(&db, &mut s) {
                 let _ = settings::save(&db, &s);
@@ -187,6 +200,9 @@ pub fn run() {
                     if let Some(l) = llamacpp::global() {
                         l.stop_all();
                     }
+                    if let Some(d) = decision::global() {
+                        d.stop();
+                    }
                     app.exit(0);
                 }
                 _ => {}
@@ -203,6 +219,9 @@ pub fn run() {
                     state::emergency_stop(window.app_handle());
                     if let Some(l) = llamacpp::global() {
                         l.stop_all();
+                    }
+                    if let Some(d) = decision::global() {
+                        d.stop();
                     }
                     window.app_handle().exit(0);
                 }
@@ -248,6 +267,7 @@ pub fn run() {
             commands::start_task,
             commands::resume_task,
             commands::agent_stop,
+            commands::cancel_tool,
             commands::agent_pause,
             commands::agent_resume,
             commands::agent_respond,
@@ -298,6 +318,13 @@ pub fn run() {
             ext_commands::vm_failed,
             ext_commands::vm_result,
             ext_commands::llama_status,
+            ext_commands::decision_status,
+            ext_commands::decision_setup,
+            ext_commands::decision_start,
+            ext_commands::decision_stop,
+            ext_commands::decision_test,
+            ext_commands::decision_try,
+            ext_commands::decision_delete_model,
             ext_commands::llama_variants,
             ext_commands::llama_install,
             ext_commands::llama_uninstall,
@@ -321,6 +348,7 @@ pub fn run() {
             commands::audit_verify,
             commands::fork_conversation,
             commands::save_text_file,
+            commands::pick_path,
             commands::open_link,
             commands::rate_message,
         ]))

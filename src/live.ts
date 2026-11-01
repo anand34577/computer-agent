@@ -1,9 +1,10 @@
 // Live state of replies and agent runs, per conversation. It lives outside React so a reply
 // keeps streaming into view when you switch chats or pages and come back.
 import { useSyncExternalStore } from "react";
-import { on, type AgentState } from "./api";
+import { on, type AgentState, type FastChecks, type ToolEvent } from "./api";
 
-export type LiveTool = { name: string; args: unknown; result?: string; status: string };
+/** permission: "auto" ran without asking, "asked" after your OK, "declined" by you, "off" was blocked. */
+export type LiveTool = { name: string; args: unknown; result?: string; status: string; permission?: string; call_id?: string; ms?: number; started?: number; title?: string };
 export type LiveReply = {
   message_id: string;
   text: string;
@@ -16,7 +17,7 @@ export type LiveReply = {
   /** Streamed pieces; servers send about one token per piece. */
   pieces: number;
 };
-export type LiveStep = { id: string; idx: number; kind: string; title: string; detail: string; result: string; risk: string };
+export type LiveStep = { id: string; idx: number; kind: string; title: string; detail: string; result: string; risk: string; screenshot?: string };
 export type LiveAgent = {
   task_id: string;
   status: string;
@@ -27,6 +28,13 @@ export type LiveAgent = {
   reasoning: string;
   model: string;
   started: number;
+  plan: string[];
+  planStep: number;
+  thought: string;
+  doing: string;
+  /** Tool calls of this task, newest last; running ones can be cancelled. */
+  tools: LiveTool[];
+  fast?: FastChecks;
 };
 export type ConvLive = {
   reply?: LiveReply;
@@ -110,14 +118,14 @@ export function initLive() {
       return { ...c, reply: p.kind === "reasoning" ? { ...base, reasoning: r.reasoning + p.text } : { ...base, text: r.text + p.text, thinkEnd: r.thinkEnd ?? (r.reasoning ? now : undefined) } };
     });
   });
-  on<{ conversation_id: string; name: string; args: unknown; status: string; result?: string }>("chat-tool", (p) => {
+  on<{ conversation_id: string; call_id?: string; name: string; args: unknown; status: string; result?: string; permission?: string; ms?: number }>("chat-tool", (p) => {
     patch(p.conversation_id, (c) => {
       const r = c.reply;
       if (!r) return c;
       const tools = [...r.tools];
-      const i = tools.findIndex((t) => t.name === p.name && t.status === "running");
-      if (p.status === "done" && i >= 0) tools[i] = { ...tools[i], status: "done", result: p.result };
-      else tools.push({ name: p.name, args: p.args, status: p.status, result: p.result });
+      const i = tools.findIndex((t) => t.status === "running" && (p.call_id ? t.call_id === p.call_id : t.name === p.name));
+      if (p.status === "done" && i >= 0) tools[i] = { ...tools[i], status: "done", result: p.result, permission: p.permission, ms: p.ms };
+      else tools.push({ name: p.name, args: p.args, status: p.status, result: p.result, permission: p.permission, call_id: p.call_id, ms: p.ms, started: Date.now() });
       return { ...c, reply: { ...r, tools } };
     });
   });
@@ -133,13 +141,25 @@ export function initLive() {
     if (!id) return;
     taskConv.set(task, id);
     patch(id, (c) => {
-      const a = c.agent && c.agent.task_id === task ? c.agent : { task_id: task, status: "starting", message: "", step: 0, steps: [], text: "", reasoning: "", model: "", started: Date.now() };
+      const a: LiveAgent = c.agent && c.agent.task_id === task ? c.agent : { task_id: task, status: "starting", message: "", step: 0, steps: [], text: "", reasoning: "", model: "", started: Date.now(), plan: [], planStep: 0, thought: "", doing: "", tools: [] };
       return { ...c, agent: fn(a) };
     });
   };
-  on<AgentState>("agent-state", (s) => agentPatch(s.task_id, s.conversation_id, (a) => ({ ...a, status: s.status, message: s.message, step: s.step, model: a.model || s.doer })));
+  on<AgentState>("agent-state", (s) =>
+    agentPatch(s.task_id, s.conversation_id, (a) => ({ ...a, status: s.status, message: s.message, step: s.step, model: a.model || s.doer, plan: s.plan ?? a.plan, planStep: s.plan_step ?? a.planStep, thought: s.thought ?? a.thought, doing: s.doing ?? a.doing, fast: s.fast ?? a.fast })),
+  );
+  on<ToolEvent>("agent-tool", (t) =>
+    agentPatch(t.task_id ?? "", t.conversation_id, (a) => {
+      const tools = [...a.tools];
+      const i = tools.findIndex((x) => x.call_id === t.call_id);
+      const row: LiveTool = { name: t.name, title: t.title, args: t.args, status: t.status, result: t.result, call_id: t.call_id, ms: t.ms, started: i >= 0 ? tools[i].started : Date.now() };
+      if (i >= 0) tools[i] = row;
+      else tools.push(row);
+      return { ...a, tools: tools.slice(-40) };
+    }),
+  );
   on<LiveStep & { task_id: string; conversation_id?: string | null }>("agent-step", (s) =>
-    agentPatch(s.task_id, s.conversation_id, (a) => ({ ...a, steps: [...a.steps, { id: s.id, idx: s.idx, kind: s.kind, title: s.title, detail: s.detail, result: s.result, risk: s.risk }].slice(-60) })),
+    agentPatch(s.task_id, s.conversation_id, (a) => ({ ...a, steps: [...a.steps, { id: s.id, idx: s.idx, kind: s.kind, title: s.title, detail: s.detail, result: s.result, risk: s.risk, screenshot: s.screenshot }].slice(-60) })),
   );
   on<{ task_id: string; conversation_id?: string | null; kind: string; text: string; model?: string }>("agent-delta", (d) =>
     agentPatch(d.task_id, d.conversation_id, (a) =>
