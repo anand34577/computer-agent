@@ -36,12 +36,12 @@ jobs:
             args: "--target x86_64-apple-darwin"
             targets: x86_64-apple-darwin
           - name: Linux x64
-            platform: ubuntu-22.04
+            platform: ubuntu-24.04
             args: ""
             targets: ""
     runs-on: ${{ matrix.platform }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v5
 
       - name: Install Linux build dependencies
         if: startsWith(matrix.platform, 'ubuntu')
@@ -52,7 +52,7 @@ jobs:
             libpipewire-0.3-dev libwayland-dev libegl1-mesa-dev libgbm-dev \
             libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxrandr-dev libxtst-dev libxi-dev
 
-      - uses: actions/setup-node@v4
+      - uses: actions/setup-node@v5
         with:
           node-version: 22
           cache: npm
