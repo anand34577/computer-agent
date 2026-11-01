@@ -1,11 +1,10 @@
 # Builds the desktop app for Windows, macOS (Apple Silicon and Intel) and Linux and publishes the
 # installers to a GitHub Release named after the version in src-tauri/tauri.conf.json.
-# Runs on every push to main (updating that version's release) and on version tags.
+# Runs on version tags (v*) or by hand, and only after the CI checks pass.
 name: Release
 
 on:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
@@ -17,8 +16,12 @@ concurrency:
   cancel-in-progress: true
 
 jobs:
+  checks:
+    uses: ./.github/workflows/ci.yml
+
   build:
     name: ${{ matrix.name }}
+    needs: checks
     strategy:
       fail-fast: false
       matrix:
@@ -81,6 +84,6 @@ jobs:
             - **Windows:** `.msi` or `-setup.exe`
             - **macOS:** `.dmg` (`aarch64` for Apple Silicon, `x64` for Intel). The builds are not notarised: right-click the app and choose Open the first time.
             - **Linux:** `.AppImage`, `.deb` or `.rpm`
-          releaseDraft: false
+          releaseDraft: true
           prerelease: false
           args: ${{ matrix.args }}

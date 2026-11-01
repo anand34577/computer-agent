@@ -6,9 +6,7 @@ use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
 use std::time::Duration;
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct PluginTool {
@@ -124,42 +122,17 @@ pub fn exposed_name(plugin: &str, tool: &str) -> String {
 pub async fn run(plugin_dir: &Path, tool: &PluginTool, args: &Value) -> Result<String> {
     let input = args.to_string();
     let mut c = crate::sandbox::program_command(&tool.command, &tool.args);
-    c.current_dir(plugin_dir)
-        .env("PLUGIN_ARGS", &input)
-        .env("PLUGIN_DIR", plugin_dir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .kill_on_drop(true);
-    let mut child = c.spawn().map_err(|e| anyhow!("Could not start '{}': {e}", tool.command))?;
-    if let Some(mut si) = child.stdin.take() {
-        let _ = si.write_all(input.as_bytes()).await;
+    c.current_dir(plugin_dir).env("PLUGIN_ARGS", &input).env("PLUGIN_DIR", plugin_dir);
+    let f = crate::sandbox::run_bounded(c, Some(input), Duration::from_secs(tool.timeout_secs.clamp(1, 600)))
+        .await
+        .map_err(|e| anyhow!("Could not start '{}': {e}", tool.command))?;
+    if f.timed_out {
+        bail!("The plugin took longer than {}s and was stopped", tool.timeout_secs);
     }
-    let mut so = child.stdout.take().unwrap();
-    let mut se = child.stderr.take().unwrap();
-    let ro = tokio::spawn(async move {
-        let mut b = vec![];
-        let _ = so.read_to_end(&mut b).await;
-        b
-    });
-    let re = tokio::spawn(async move {
-        let mut b = vec![];
-        let _ = se.read_to_end(&mut b).await;
-        b
-    });
-    let status = match tokio::time::timeout(Duration::from_secs(tool.timeout_secs.clamp(1, 600)), child.wait()).await {
-        Ok(s) => s?,
-        Err(_) => {
-            let _ = child.kill().await;
-            bail!("The plugin took longer than {}s and was stopped", tool.timeout_secs);
-        }
-    };
-    let out = String::from_utf8_lossy(&ro.await.unwrap_or_default()).to_string();
-    let err = String::from_utf8_lossy(&re.await.unwrap_or_default()).to_string();
-    if !status.success() {
-        bail!("Plugin exited with code {}: {}", status.code().unwrap_or(-1), err.trim().chars().take(1500).collect::<String>());
+    if f.code != Some(0) {
+        bail!("Plugin exited with code {}: {}", f.code.unwrap_or(-1), f.stderr.trim().chars().take(1500).collect::<String>());
     }
-    Ok(out.chars().take(20000).collect())
+    Ok(f.stdout.chars().take(20000).collect())
 }
 
 /// Creates a working example plugin the user can copy and edit.

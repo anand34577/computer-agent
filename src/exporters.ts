@@ -4,7 +4,6 @@ import { createElement } from "react";
 import { renderToStaticMarkup } from "react-dom/server";
 import ReactMarkdown from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { save } from "@tauri-apps/plugin-dialog";
 import { api, type Conversation, type Message } from "./api";
 
 const who = (m: Message, assistant: string) => (m.role === "user" ? "You" : m.meta?.task_id ? "Agent" : assistant);
@@ -56,7 +55,7 @@ export function toHTML(c: Conversation, assistant: string): string {
 /** Asks where to save, then writes the file. Returns the path, or null if cancelled. */
 export async function saveExport(defaultName: string, ext: "md" | "json" | "html" | "csv", content: string): Promise<string | null> {
   const names = { md: "Markdown", json: "JSON", html: "Web page", csv: "CSV" };
-  const path = await save({ defaultPath: `${safeName(defaultName)}.${ext}`, filters: [{ name: names[ext], extensions: [ext] }] });
+  const path = await api.pickPath("save", { defaultName: `${safeName(defaultName)}.${ext}`, filterName: names[ext], extensions: [ext] });
   if (!path) return null;
   await api.saveTextFile(path, content);
   return path;

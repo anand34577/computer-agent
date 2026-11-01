@@ -45,8 +45,8 @@
         "label": "pointer",
         "title": "Agent Pointer",
         "url": "index.html#pointer",
-        "width": 64,
-        "height": 64,
+        "width": 300,
+        "height": 80,
         "resizable": false,
         "decorations": false,
         "transparent": true,
@@ -59,7 +59,34 @@
       }
     ],
     "security": {
-      "csp": null
+      "csp": {
+        "default-src": "'self' ipc: http://ipc.localhost",
+        "script-src": "'self' 'wasm-unsafe-eval'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob: asset: http://asset.localhost",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost",
+        "worker-src": "'self' blob:",
+        "media-src": "'self' data: blob:",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "frame-src": "'self'",
+        "form-action": "'none'"
+      },
+      "devCsp": {
+        "default-src": "'self' ipc: http://ipc.localhost",
+        "script-src": "'self' 'unsafe-inline' 'wasm-unsafe-eval'",
+        "style-src": "'self' 'unsafe-inline'",
+        "img-src": "'self' data: blob: asset: http://asset.localhost",
+        "font-src": "'self' data:",
+        "connect-src": "'self' ipc: http://ipc.localhost ws://localhost:1420 http://localhost:1420",
+        "worker-src": "'self' blob:",
+        "media-src": "'self' data: blob:",
+        "object-src": "'none'",
+        "base-uri": "'none'",
+        "frame-src": "'self'",
+        "form-action": "'none'"
+      }
     }
   },
   "bundle": {

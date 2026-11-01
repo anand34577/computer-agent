@@ -7,6 +7,7 @@ import { api, errText, money, on, type CatalogItem, type Model, type Overrides, 
 import { CAPS, Callout, Caps, Card, Checkbox, ConfirmDialog, Empty, Field, Modal, NumberField, Pagination, Progress, Select, SelectField, Skeleton, Spinner, Switch, TextField, usePaged, useApp } from "../components/common";
 import * as v from "../validate";
 import LlamaEngine from "./LlamaEngine";
+import DecisionModel from "./DecisionModel";
 
 export const PRESETS = [
   { id: "openai", label: "OpenAI", kind: "openai", base: "https://api.openai.com/v1", key: true, keyNeeded: true },
@@ -51,7 +52,7 @@ export default function ModelsView() {
         </div>
         {tab === "models" && <ModelList onAdd={() => setAdding(true)} />}
         {tab === "providers" && <Providers onAdd={() => setAdding(true)} onBrowse={setBrowse} />}
-        {tab === "roles" && <Roles />}
+        {tab === "roles" && <><Roles /><div style={{ marginTop: 16 }}><DecisionModel /></div></>}
         {tab === "engine" && <LlamaEngine />}
         {tab === "local" && <LocalModels />}
       </div>
@@ -571,7 +572,7 @@ function Roles() {
     </SelectField>
   );
   const doer = models.find((m) => m.id === (settings.roles.doer ?? settings.default_model));
-  const mode = doer?.effective.vision ? "Vision: the Doer reads screenshots with numbered tags." : settings.roles.eyes ? "Eyes: a vision model describes the screen for the text-only Doer." : "Accessibility view: the Doer works from a text map of the window. Add an Eyes model for apps that expose little.";
+  const mode = (doer?.effective.vision ? "Vision: the Doer reads screenshots with numbered tags." : settings.roles.eyes ? "Eyes: a vision model describes the screen for the text-only Doer." : "Accessibility view: the Doer works from a text map of the window. Add an Eyes model for apps that expose little.") + (settings.roles.locator ? " The Locator pinpoints anything the Doer describes." : "");
   return (
     <Card title="Who does what" subtitle="Leave everything on the default model, or mix: a local model for routine steps and a stronger one for planning." icon={Users}>
       <div className="grid2">
@@ -580,6 +581,15 @@ function Roles() {
         {sel("Planner", "Breaks goals into steps and helps when stuck.", settings.roles.planner, (x) => setSettings({ ...settings, roles: { ...settings.roles, planner: x } }), models, "Same as Doer")}
         {sel("Doer", "Performs each step on screen.", settings.roles.doer, (x) => setSettings({ ...settings, roles: { ...settings.roles, doer: x } }), models, "Default chat model")}
         {sel("Eyes", "A vision model that describes the screen for text-only Doers.", settings.roles.eyes, (x) => setSettings({ ...settings, roles: { ...settings.roles, eyes: x } }), vision, vision.length ? "None" : "No vision models yet")}
+        {sel("Locator (fast)", "A small vision grounding model, such as UI-TARS, Holo, GroundNext, Phi-Ground or Qwen-VL. It finds what the Doer describes, so the Doer can act on screens with no numbered tags.", settings.roles.locator, (x) => setSettings({ ...settings, roles: { ...settings.roles, locator: x } }), vision, vision.length ? "None" : "No vision models yet")}
+        {settings.roles.locator && (
+          <SelectField label="Locator points" hint="How the locator writes positions. Auto works for most; pick one if clicks land in the wrong place." value={settings.roles.locator_coords || "auto"} onChange={(x) => setSettings({ ...settings, roles: { ...settings.roles, locator_coords: x } })}>
+            <option value="auto">Auto-detect</option>
+            <option value="pixels">Image pixels (UI-TARS 1.5, Qwen2.5-VL)</option>
+            <option value="norm1000">0 to 1000 (Qwen3-VL, UI-TARS-2, GLM)</option>
+            <option value="norm1">0 to 1 (Holo, some Gemma)</option>
+          </SelectField>
+        )}
         <TextField label="Checker" value="Built-in safety rules (always on)" onChange={() => {}} disabled hint="Safety decisions are never left to a model." />
       </div>
       <div style={{ marginTop: 16 }}><Callout kind="info">Current agent mode: {mode}</Callout></div>

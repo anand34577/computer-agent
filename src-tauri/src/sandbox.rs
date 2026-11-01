@@ -51,6 +51,80 @@ fn clip(s: &str, n: usize) -> String {
     }
 }
 
+/// Output kept per stream; the rest is read and dropped so the program never blocks on a full pipe.
+const MAX_OUTPUT: usize = 2_000_000;
+
+pub struct Finished {
+    pub code: Option<i32>,
+    pub stdout: String,
+    pub stderr: String,
+    pub timed_out: bool,
+}
+
+async fn drain(mut r: impl tokio::io::AsyncRead + Unpin) -> Vec<u8> {
+    let (mut keep, mut chunk) = (Vec::new(), vec![0u8; 16384]);
+    while let Ok(n) = r.read(&mut chunk).await {
+        if n == 0 {
+            break;
+        }
+        let room = MAX_OUTPUT.saturating_sub(keep.len());
+        keep.extend_from_slice(&chunk[..n.min(room)]);
+    }
+    keep
+}
+
+/// Stops a process and everything it started (a shell's children would otherwise keep running
+/// and hold the output pipes open).
+async fn kill_tree(child: &mut tokio::process::Child) {
+    if let Some(pid) = child.id() {
+        #[cfg(windows)]
+        let _ = command("taskkill").args(["/T", "/F", "/PID", &pid.to_string()]).output().await;
+        #[cfg(unix)]
+        let _ = Command::new("kill").args(["-KILL", &format!("-{pid}")]).output().await;
+    }
+    let _ = child.kill().await;
+}
+
+/// Runs a prepared command with optional stdin, a time limit that ends the whole process tree,
+/// and bounded output.
+pub async fn run_bounded(mut c: Command, input: Option<String>, limit: Duration) -> Result<Finished> {
+    use tokio::io::AsyncWriteExt;
+    c.stdin(if input.is_some() { Stdio::piped() } else { Stdio::null() }).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
+    #[cfg(unix)]
+    c.process_group(0);
+    let mut child = c.spawn()?;
+    if let (Some(text), Some(mut si)) = (input, child.stdin.take()) {
+        // Write in the background so a program that prints before reading cannot deadlock us.
+        tokio::spawn(async move {
+            let _ = si.write_all(text.as_bytes()).await;
+        });
+    }
+    let out = tokio::spawn(drain(child.stdout.take().ok_or_else(|| anyhow!("no stdout"))?));
+    let err = tokio::spawn(drain(child.stderr.take().ok_or_else(|| anyhow!("no stderr"))?));
+    let (code, timed_out) = match tokio::time::timeout(limit, child.wait()).await {
+        Ok(Ok(st)) => (st.code(), false),
+        Ok(Err(e)) => bail!("Command failed: {e}"),
+        Err(_) => {
+            kill_tree(&mut child).await;
+            (None, true)
+        }
+    };
+    // Grandchildren may still hold the pipes; never wait on them for long.
+    let grace = Duration::from_secs(if timed_out { 2 } else { 10 });
+    let collect = |h: tokio::task::JoinHandle<Vec<u8>>| async move {
+        let abort = h.abort_handle();
+        match tokio::time::timeout(grace, h).await {
+            Ok(Ok(b)) => b,
+            _ => {
+                abort.abort();
+                Vec::new()
+            }
+        }
+    };
+    let (o, e) = tokio::join!(collect(out), collect(err));
+    Ok(Finished { code, stdout: String::from_utf8_lossy(&o).to_string(), stderr: String::from_utf8_lossy(&e).to_string(), timed_out })
+}
+
 /// Builds a command that hides the console window on Windows.
 pub fn command(program: &str) -> Command {
     #[allow(unused_mut)]
@@ -81,7 +155,7 @@ pub fn program_command(program: &str, args: &[String]) -> Command {
 /// WSL prints its list in UTF-16.
 fn decode_wsl(bytes: &[u8]) -> String {
     if bytes.len() >= 2 && bytes.iter().skip(1).step_by(2).take(8).all(|b| *b == 0) {
-        let u16s: Vec<u16> = bytes.chunks_exact(2).map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
+        let u16s: Vec<u16> = bytes.as_chunks::<2>().0.iter().map(|c| u16::from_le_bytes([c[0], c[1]])).collect();
         String::from_utf16_lossy(&u16s)
     } else {
         String::from_utf8_lossy(bytes).to_string()
@@ -168,33 +242,10 @@ pub async fn run(vm: &crate::microvm::Vm, cfg: &SandboxCfg, drop_dir: &Path, cmd
         };
         (c, "host shell".to_string())
     };
-    c.stdin(Stdio::null()).stdout(Stdio::piped()).stderr(Stdio::piped()).kill_on_drop(true);
     if label == "host shell" {
         c.current_dir(dirs::home_dir().unwrap_or_else(std::env::temp_dir));
     }
-    let mut child = c.spawn().map_err(|e| anyhow!("Could not start the command ({label}): {e}"))?;
-    let mut out = child.stdout.take().unwrap();
-    let mut err = child.stderr.take().unwrap();
-    let read_out = tokio::spawn(async move {
-        let mut b = Vec::new();
-        let _ = out.read_to_end(&mut b).await;
-        b
-    });
-    let read_err = tokio::spawn(async move {
-        let mut b = Vec::new();
-        let _ = err.read_to_end(&mut b).await;
-        b
-    });
     let timeout = Duration::from_secs(cfg.timeout_secs.clamp(5, 3600) as u64);
-    let (code, timed_out) = match tokio::time::timeout(timeout, child.wait()).await {
-        Ok(Ok(st)) => (st.code().unwrap_or(-1), false),
-        Ok(Err(e)) => bail!("Command failed: {e}"),
-        Err(_) => {
-            let _ = child.kill().await;
-            (-1, true)
-        }
-    };
-    let stdout = String::from_utf8_lossy(&read_out.await.unwrap_or_default()).to_string();
-    let stderr = String::from_utf8_lossy(&read_err.await.unwrap_or_default()).to_string();
-    Ok(CmdOutput { code, stdout, stderr, target: label, timed_out })
+    let f = run_bounded(c, None, timeout).await.map_err(|e| anyhow!("Could not start the command ({label}): {e}"))?;
+    Ok(CmdOutput { code: f.code.unwrap_or(-1), stdout: f.stdout, stderr: f.stderr, target: label, timed_out: f.timed_out })
 }

@@ -49,6 +49,7 @@ export type Settings = {
   send_on_enter: boolean;
   sandbox: SandboxCfg;
   llama: LlamaCfg;
+  decision: DecisionCfg;
   mcp_servers: McpServer[];
   plugins: Record<string, { enabled: boolean; permission: string }>;
   web_search: boolean;
@@ -56,7 +57,7 @@ export type Settings = {
   density: string;
   layer: string;
   default_model: string | null;
-  roles: { planner: string | null; doer: string | null; eyes: string | null };
+  roles: { planner: string | null; doer: string | null; eyes: string | null; locator: string | null; locator_coords: string };
   fallback_model: string | null;
   local_only: boolean;
   system_prompt: string;
@@ -104,7 +105,7 @@ export type Message = {
   content: string;
   images: Attachment[];
   reasoning: string;
-  meta: { tools?: { name: string; args: unknown; result: string }[]; cost?: number; model?: string; task_id?: string; status?: string; stopped?: boolean; input_tokens?: number; output_tokens?: number; rating?: number; tps?: number; ttft_ms?: number; gen_ms?: number; docs?: DocRef[] };
+  meta: { tools?: { name: string; args: unknown; result: string; permission?: string; ms?: number }[]; cost?: number; model?: string; task_id?: string; status?: string; stopped?: boolean; input_tokens?: number; output_tokens?: number; rating?: number; tps?: number; ttft_ms?: number; gen_ms?: number; docs?: DocRef[] };
   model_id: string | null;
   created: number;
 };
@@ -122,7 +123,7 @@ export type Task = {
   started: number;
   ended: number | null;
   summary: string;
-  models: { doer?: string; planner?: string; eyes?: string | null; mode?: string };
+  models: { doer?: string; planner?: string; eyes?: string | null; locator?: string | null; mode?: string };
   undoable: number;
 };
 
@@ -141,6 +142,19 @@ export type Step = {
   created: number;
 };
 
+export type DecisionCfg = {
+  enabled: boolean; backend: "gguf" | "python"; url: string; model_repo: string; device: string; autostart: boolean; threshold: number; budget_ms: number;
+  check_loading: boolean; check_result: boolean; check_done: boolean; check_plan: boolean; check_signin: boolean; log: boolean;
+};
+export type DecisionStatus = {
+  backend: string; installed: boolean; engine_installed: boolean; setup_running: boolean; running: boolean; ready: boolean; local: boolean; dir: string;
+  info: { model?: string; device?: string; dtype?: string }; last_ms: number | null; log: string[];
+  files: { name: string; size: number; present: boolean; source: string }[]; model_dir: string;
+};
+export type DecisionAnswer = { type: "noul" | "choice"; decision: string; confidence: number; probabilities: Record<string, number> };
+/** Latest fast-check answers during a task. */
+export type FastChecks = { ms?: number; error?: string; paused?: boolean; items?: { name: string; decision: string; confidence: number; sure: boolean }[] } | null;
+
 export type AgentState = {
   task_id: string;
   goal: string;
@@ -153,7 +167,18 @@ export type AgentState = {
   doer: string;
   local: boolean;
   conversation_id?: string | null;
+  /** The approved plan and the step the agent says it is on (1-based, 0 = unknown). */
+  plan?: string[];
+  plan_step?: number;
+  /** Its latest note on what it sees and why, and the action it is doing now. */
+  thought?: string;
+  doing?: string;
+  locator?: string | null;
+  fast?: FastChecks;
 };
+
+/** A tool call in progress or finished, from a chat reply or an agent task. */
+export type ToolEvent = { call_id: string; name: string; title?: string; args: unknown; status: "running" | "done"; result?: string; ms?: number; task_id?: string; conversation_id?: string | null };
 
 export type Prompt = {
   id: string;
@@ -200,7 +225,8 @@ export const api = {
   ollamaPull: (baseUrl: string, name: string) => invoke<void>("ollama_pull", { baseUrl, name }),
   ollamaDelete: (baseUrl: string, name: string) => invoke<void>("ollama_delete", { baseUrl, name }),
 
-  listConversations: (query = "") => invoke<ConvSummary[]>("list_conversations", { query }),
+  /** Pinned and foldered chats, plus the newest `limit` others; `loose_total` counts all of those others. */
+  listConversations: (query = "", limit = 40) => invoke<{ items: ConvSummary[]; loose_total: number }>("list_conversations", { query, limit }),
   createConversation: (modelId: string | null, folder = "") => invoke<string>("create_conversation", { modelId, folder }),
   getConversation: (id: string) => invoke<Conversation>("get_conversation", { id }),
   updateConversation: (id: string, patch: Record<string, unknown>) => invoke<void>("update_conversation", { id, patch }),
@@ -211,8 +237,12 @@ export const api = {
   saveTextFile: (path: string, content: string) => invoke<void>("save_text_file", { path, content }),
   sendMessage: (conversationId: string, content: string, images: Attachment[], modelId: string, think: boolean | null = null, docs: DocRef[] = []) =>
     invoke<string>("send_message", { conversationId, content, images, modelId, think, docs }),
-  docsAdd: (conversationId: string, name: string, mode: "embed" | "direct", src: { path?: string; data?: string }) =>
-    invoke<DocRef>("docs_add", { conversationId, name, mode, path: src.path ?? null, data: src.data ?? null }),
+  docsAdd: (conversationId: string, name: string, mode: "embed" | "direct", src: { data: string }) =>
+    invoke<DocRef>("docs_add", { conversationId, name, mode, data: src.data }),
+  /** Native file dialog. Only paths picked here are accepted by the save and import commands. */
+  pickPath: (mode: "open" | "save" | "folder", opts: { title?: string; filterName?: string; extensions?: string[]; defaultName?: string } = {}) =>
+    invoke<string | null>("pick_path", { mode, title: opts.title ?? null, filterName: opts.filterName ?? null, extensions: opts.extensions ?? null, defaultName: opts.defaultName ?? null }),
+  readTextFile: (path: string) => invoke<string>("read_text_file", { path }),
   docsList: (conversationId: string) => invoke<(DocRef & { created: number })[]>("docs_list", { conversationId }),
   docsRemove: (id: string) => invoke<void>("docs_remove", { id }),
   stats: (days: number) => invoke<Stats>("stats", { days }),
@@ -226,6 +256,8 @@ export const api = {
   startTask: (goal: string, conversationId: string | null, modelId: string | null = null) => invoke<string>("start_task", { goal, conversationId, modelId }),
   resumeTask: (taskId: string) => invoke<string>("resume_task", { taskId }),
   agentStop: () => invoke<void>("agent_stop"),
+  /** Cancels one running tool call; the reply or task carries on. False if it already finished. */
+  cancelTool: (callId: string) => invoke<boolean>("cancel_tool", { callId }),
   agentPause: () => invoke<void>("agent_pause"),
   agentResume: () => invoke<void>("agent_resume"),
   agentRespond: (id: string, value: Record<string, unknown>) => invoke<void>("agent_respond", { id, value }),
@@ -243,7 +275,7 @@ export const api = {
   savePlaybook: (name: string, goal: string) => invoke<void>("save_playbook", { name, goal }),
   deletePlaybook: (id: string) => invoke<void>("delete_playbook", { id }),
 
-  wipeAll: () => invoke<void>("wipe_all_data"),
+  wipeAll: (includeAudit: boolean) => invoke<void>("wipe_all_data", { includeAudit }),
   platformInfo: () => invoke<PlatformInfo>("platform_info"),
   diagnostics: () => invoke<string>("diagnostics_report"),
   usage: () => invoke<{ today: number; total: number }>("usage_summary"),
@@ -278,6 +310,14 @@ export const api = {
   vmStop: () => invoke<void>("vm_stop"),
 
   llamaStatus: () => invoke<LlamaStatus>("llama_status"),
+  decisionStatus: () => invoke<DecisionStatus>("decision_status"),
+  decisionSetup: (gpu: boolean) => invoke<void>("decision_setup", { gpu }),
+  decisionStart: () => invoke<DecisionStatus>("decision_start"),
+  decisionStop: () => invoke<DecisionStatus>("decision_stop"),
+  decisionDeleteModel: () => invoke<DecisionStatus>("decision_delete_model"),
+  decisionTry: (questions: { name: string; instructions: string; options: string[] | null }[], context: string, delaySecs: number) =>
+    invoke<{ ms: number; answers: Record<string, DecisionAnswer>; image: string }>("decision_try", { questions, context, delaySecs }),
+  decisionTest: () => invoke<{ ms: number; server_ms?: number; model?: string; answers: Record<string, { decision: string; confidence: number }> }>("decision_test"),
   llamaVariants: () => invoke<{ id: string; label: string; about: string; size: number; recommended?: boolean }[]>("llama_variants"),
   llamaInstall: (variant: string) => invoke<LlamaStatus>("llama_install", { variant }),
   llamaUninstall: () => invoke<void>("llama_uninstall"),

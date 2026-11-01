@@ -1,8 +1,9 @@
 import { useEffect, useState } from "react";
 import {
-  BookmarkPlus, CheckCircle2, Clock, Download, Eye, EyeOff, History, Image as ImageIcon, ListOrdered, Play, Repeat, Search, ShieldAlert, Trash2, Undo2, X, XCircle,
+  BookmarkPlus, CheckCircle2, Clock, Download, Eye, History, ListOrdered, Play, Repeat, Search, Trash2, Undo2, Wrench, X, XCircle,
 } from "lucide-react";
-import { api, errText, money, on, type Step, type Task } from "../api";
+import { api, errText, money, on, type Step, type Task, type ToolEvent } from "../api";
+import { CallDetail, CancelCall, StepRow, useElapsed } from "../components/AgentParts";
 import { Callout, Card, Checkbox, ConfirmDialog, Empty, Pagination, PromptDialog, Skeleton, Spinner, timeAgo, usePaged, useApp } from "../components/common";
 
 const STATUS: Record<string, string> = { done: "ok", failed: "bad", stopped: "warn", interrupted: "warn", running: "accent", resumed: "" };
@@ -21,6 +22,7 @@ export default function ActivityView({ onPlaybooksChanged }: { onPlaybooksChange
   const [confirm, setConfirm] = useState<{ kind: "undo" | "delete" | "playbook"; id: string; label: string } | null>(null);
   const [picked, setPicked] = useState<Set<string>>(new Set());
   const [bulkDel, setBulkDel] = useState(false);
+  const [running, setRunning] = useState<Record<string, ToolEvent & { started: number }>>({});
 
   const refresh = async () => {
     setTasks(await api.listTasks());
@@ -36,7 +38,15 @@ export default function ActivityView({ onPlaybooksChanged }: { onPlaybooksChange
           return cur;
         });
       }),
-      on("agent-finished", () => refresh()),
+      on<ToolEvent>("agent-tool", (t) =>
+        setRunning((r) => {
+          const n = { ...r };
+          if (t.status === "running") n[t.call_id] = { ...t, started: Date.now() };
+          else delete n[t.call_id];
+          return n;
+        }),
+      ),
+      on("agent-finished", () => { setRunning({}); refresh(); }),
       on<{ id: string; goal: string }[]>("agent-queue", (qq) => setQueue(qq)),
     ];
     return () => offs.forEach((f) => f());
@@ -62,8 +72,8 @@ export default function ActivityView({ onPlaybooksChanged }: { onPlaybooksChange
   };
 
   return (
-    <div className="page">
-      <div className="page-inner">
+    <div className="page page-fixed">
+      <div className="page-inner wide">
         <div className="page-head">
           <div className="grow">
             <h1>Activity</h1>
@@ -97,8 +107,8 @@ export default function ActivityView({ onPlaybooksChanged }: { onPlaybooksChange
           </div>
         )}
 
-        <div className="split">
-          <div>
+        <div className="split split-scroll">
+          <div className="split-pane">
             <div className="input-group" style={{ marginBottom: 8 }}><Search size={15} className="lead" /><input className="input" placeholder="Search tasks" value={filter} onChange={(e) => setFilter(e.target.value)} /></div>
             {tasks && tasks.length > 0 && (
               <div className="row wrap" style={{ gap: 6, marginBottom: 10 }}>
@@ -140,7 +150,7 @@ export default function ActivityView({ onPlaybooksChanged }: { onPlaybooksChange
             ))}
             <Pagination page={pg.page} pages={pg.pages} total={pg.total} pageSize={pg.pageSize} onPage={pg.setPage} />
           </div>
-          <div>
+          <div className="split-pane" key={sel ?? "none"}>
             {task ? (
               <Card>
                 <div className="card-head">
@@ -166,6 +176,7 @@ export default function ActivityView({ onPlaybooksChanged }: { onPlaybooksChange
                 {task.summary && <div style={{ marginBottom: 12 }}><Callout kind={task.status === "done" ? "ok" : "warn"}>{task.summary}</Callout></div>}
                 <div className="input-group" style={{ marginBottom: 6 }}><Search size={15} className="lead" /><input className="input" placeholder="Search steps" value={q} onChange={(e) => setQ(e.target.value)} /></div>
                 <div className="timeline">{steps.map((s) => <StepRow key={s.id} s={s} onZoom={setBig} />)}</div>
+                {Object.values(running).filter((t) => t.task_id === task.id).map((t) => <RunningCall key={t.call_id} t={t} />)}
                 {steps.length === 0 && <p className="muted">No steps recorded.</p>}
               </Card>
             ) : (
@@ -221,32 +232,18 @@ export default function ActivityView({ onPlaybooksChanged }: { onPlaybooksChange
   );
 }
 
-function StepRow({ s, onZoom }: { s: Step; onZoom: (src: string) => void }) {
-  const [img, setImg] = useState<string | null>(null);
-  const [show, setShow] = useState(false);
-  useEffect(() => {
-    if (show && s.screenshot && !img) api.readScreenshot(s.screenshot).then((b) => setImg(`data:image/jpeg;base64,${b}`)).catch(() => setImg(""));
-  }, [show]);
-  const riskBadge = s.risk === "gate" || s.risk === "blocked" ? "bad" : s.risk === "risky" ? "warn" : "";
+function RunningCall({ t }: { t: ToolEvent & { started: number } }) {
+  const secs = useElapsed(t.started);
   return (
-    <div className="step">
-      <div className="n small">{s.idx}</div>
-      <div>
+    <div className="step running-call">
+      <div className="n small"><Wrench size={13} /></div>
+      <div style={{ minWidth: 0 }}>
         <div className="row wrap">
-          <b className="grow">{s.title}</b>
-          <span className="badge">{s.kind}</span>
-          {s.risk && s.risk !== "routine" && s.risk !== "observe" && <span className={"badge " + riskBadge}><ShieldAlert size={11} /> {s.risk}</span>}
-          {s.cost > 0 && <span className="badge">{money(s.cost)}</span>}
+          <b className="grow">{t.title || t.name}</b>
+          <span className="badge accent">running · {secs}s</span>
+          <CancelCall callId={t.call_id} />
         </div>
-        {s.detail && <div className="small muted" style={{ whiteSpace: "pre-wrap", marginTop: 4 }}>{s.detail}</div>}
-        {s.result && <div className="small" style={{ marginTop: 4 }}>→ {s.result}</div>}
-        {s.screenshot && (
-          <div>
-            <button className="btn sm subtle" style={{ marginTop: 4, paddingLeft: 0 }} onClick={() => setShow(!show)}>{show ? <EyeOff size={13} /> : <ImageIcon size={13} />} {show ? "Hide" : "Show"} screenshot</button>
-            {show && img && <img className="shot" src={img} alt={`What the agent saw at step ${s.idx}`} onClick={() => onZoom(img)} />}
-            {show && img === "" && <div className="small muted">Screenshot expired (retention setting).</div>}
-          </div>
-        )}
+        <CallDetail args={t.args} />
       </div>
     </div>
   );

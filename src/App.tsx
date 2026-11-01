@@ -1,25 +1,28 @@
-import { useCallback, useEffect, useMemo, useState } from "react";
+import { lazy, Suspense, useCallback, useEffect, useMemo, useRef, useState } from "react";
 import {
   BarChart3, Blocks, Bot, CheckSquare, Cloud, Cpu, Download, Folder, GitFork, History, Lock, MessageSquare, Moon, MoreHorizontal, Palette, Pencil, Pin, PinOff, Play, Plus,
   ScrollText, Search, Settings as SettingsIcon, ShieldCheck, Square, Sun, Trash2, X,
 } from "lucide-react";
 import { api, errText, money, on, type AgentState, type ConvSummary, type Model, type Prompt, type Settings } from "./api";
-import { Checkbox, ConfirmDialog, Ctx, Menu, Modal, PromptDialog, Spinner, Toasts, type Toast } from "./components/common";
+import { Callout, Checkbox, ConfirmDialog, Ctx, Menu, Modal, PromptDialog, Spinner, Toasts, type Toast, type ToastAction } from "./components/common";
+
+const UNDO_MS = 6500;
 import { saveExport, toMarkdown } from "./exporters";
 import { live, useLiveBusy } from "./live";
-import StatsView from "./views/StatsView";
 import CommandPalette, { type Command } from "./components/CommandPalette";
 import ErrorBoundary from "./components/ErrorBoundary";
 import TitleBar from "./components/TitleBar";
 import { applyTheme } from "./theme";
 import { parseEngineErrors } from "./validate";
 import ChatView from "./views/ChatView";
-import ModelsView from "./views/ModelsView";
-import ActivityView from "./views/ActivityView";
-import SettingsView from "./views/SettingsView";
-import ExtensionsView from "./views/ExtensionsView";
+// Pages other than chat load on first visit, keeping startup light.
+const ModelsView = lazy(() => import("./views/ModelsView"));
+const ExtensionsView = lazy(() => import("./views/ExtensionsView"));
+const ActivityView = lazy(() => import("./views/ActivityView"));
+const StatsView = lazy(() => import("./views/StatsView"));
+const AuditView = lazy(() => import("./views/AuditView"));
+const SettingsView = lazy(() => import("./views/SettingsView"));
 import Onboarding from "./views/Onboarding";
-import AuditView from "./views/AuditView";
 
 export type View = "chat" | "models" | "extensions" | "activity" | "stats" | "audit" | "settings";
 
@@ -68,21 +71,48 @@ export default function App() {
   const [bulkDel, setBulkDel] = useState(false);
   const [bulkFolder, setBulkFolder] = useState(false);
   useLiveBusy(); // re-render the sidebar when a chat starts or stops replying
-  const [confirmDel, setConfirmDel] = useState<ConvSummary | null>(null);
   const [palette, setPalette] = useState(false);
   const [playbooks, setPlaybooks] = useState<{ id: string; name: string; goal: string }[]>([]);
   const [shownChats, setShownChats] = useState(CHAT_PAGE);
+  const [looseTotal, setLooseTotal] = useState(0);
   const [renaming, setRenaming] = useState<ConvSummary | null>(null);
   const [convsLoaded, setConvsLoaded] = useState(false);
 
-  const toast = useCallback((text: string, kind: Toast["kind"] = "info") => {
+  const toast = useCallback((text: string, kind: Toast["kind"] = "info", action?: ToastAction) => {
     const id = Date.now() + Math.random();
-    setToasts((t) => [...t.slice(-3), { id, text, kind }]);
-    setTimeout(() => setToasts((t) => t.filter((x) => x.id !== id)), kind === "bad" ? 7000 : 4000);
+    const dismiss = () => setToasts((t) => t.filter((x) => x.id !== id));
+    const act = action && { label: action.label, run: () => { dismiss(); action.run(); } };
+    setToasts((t) => [...t.slice(-3), { id, text, kind, action: act }]);
+    setTimeout(dismiss, action ? UNDO_MS : kind === "bad" ? 7000 : 4000);
   }, []);
 
   const refreshModels = useCallback(async () => setModels(await api.listModels()), []);
-  const refreshConvs = useCallback(async () => { setConvs(await api.listConversations(query)); setConvsLoaded(true); }, [query]);
+  // Chats deleted moments ago stay hidden until their Undo window ends, then are removed for good.
+  const pendingDelete = useRef(new Map<string, number>());
+  // Only the chats on screen are loaded; "Show more" asks the engine for the next page.
+  const refreshConvs = useCallback(async () => {
+    const r = await api.listConversations(query, shownChats);
+    setConvs(r.items.filter((c) => !pendingDelete.current.has(c.id)));
+    setLooseTotal(Math.max(0, r.loose_total - pendingDelete.current.size));
+    setConvsLoaded(true);
+  }, [query, shownChats]);
+  const deleteChat = useCallback((c: { id: string; title: string }) => {
+    setConvs((cs) => cs.filter((x) => x.id !== c.id));
+    setConvId((cur) => (cur === c.id ? null : cur));
+    const timer = window.setTimeout(async () => {
+      pendingDelete.current.delete(c.id);
+      try { await api.deleteConversation(c.id); } catch (e) { toast(errText(e), "bad"); }
+      refreshConvs();
+    }, UNDO_MS);
+    pendingDelete.current.set(c.id, timer);
+    toast(`Deleted “${c.title}”`, "ok", { label: "Undo", run: () => { clearTimeout(timer); pendingDelete.current.delete(c.id); refreshConvs(); } });
+  }, [toast, refreshConvs]);
+  // Closing the window during an Undo window still completes the deletion.
+  useEffect(() => {
+    const flush = () => pendingDelete.current.forEach((t, id) => { clearTimeout(t); api.deleteConversation(id); });
+    window.addEventListener("beforeunload", flush);
+    return () => window.removeEventListener("beforeunload", flush);
+  }, []);
 
   const setSettings = useCallback(
     async (s: Settings) => {
@@ -132,9 +162,10 @@ export default function App() {
 
   useEffect(() => {
     const t = setTimeout(() => refreshConvs().catch(() => {}), 150);
-    setShownChats(CHAT_PAGE);
     return () => clearTimeout(t);
   }, [refreshConvs]);
+  // A new filter starts again from the first page.
+  useEffect(() => setShownChats(CHAT_PAGE), [query]);
 
   useEffect(() => {
     if (!settings) return;
@@ -302,7 +333,7 @@ export default function App() {
             { label: c.pinned ? "Unpin" : "Pin to top", icon: c.pinned ? PinOff : Pin, onClick: () => api.updateConversation(c.id, { pinned: !c.pinned }).then(refreshConvs) },
             { label: "Fork", icon: GitFork, onClick: () => forkChat(c) },
             "sep",
-            { label: "Delete", icon: Trash2, danger: true, onClick: () => setConfirmDel(c) },
+            { label: "Delete", icon: Trash2, danger: true, onClick: () => deleteChat(c) },
           ]} />
       </span>
     </div>
@@ -376,8 +407,8 @@ export default function App() {
                     {list.map(item)}
                   </div>
                 ))}
-                {loose.length > shownChats && (
-                  <button className="btn sm subtle block" style={{ margin: "8px 0" }} onClick={() => setShownChats((n) => n + CHAT_PAGE)}>Show {Math.min(CHAT_PAGE, loose.length - shownChats)} more · {loose.length - shownChats} left</button>
+                {looseTotal > loose.length && (
+                  <button className="btn sm subtle block" style={{ margin: "8px 0" }} onClick={() => setShownChats((n) => n + CHAT_PAGE)}>Show {Math.min(CHAT_PAGE, looseTotal - loose.length)} more · {looseTotal - loose.length} left</button>
                 )}
                 {convsLoaded && convs.length === 0 && <div className="small muted" style={{ padding: "8px 10px" }}>{query ? "No chats match" : "Your chats will appear here"}</div>}
               </div>
@@ -407,13 +438,15 @@ export default function App() {
               </div>
             )}
             <ErrorBoundary resetKey={view}>
-              {view === "chat" && <ChatView convId={convId} setConvId={setConvId} refreshConvs={refreshConvs} agentRunning={agentRunning} goModels={() => go("models")} playbooks={playbooks} />}
+              <Suspense fallback={<div className="page-loading" role="status" aria-live="polite"><Spinner size={18} /> Loading…</div>}>
+              {view === "chat" && <ChatView deleteChat={deleteChat} convId={convId} setConvId={setConvId} refreshConvs={refreshConvs} agentRunning={agentRunning} goModels={() => go("models")} playbooks={playbooks} />}
               {view === "models" && <ModelsView />}
               {view === "extensions" && <ExtensionsView />}
               {view === "activity" && <ActivityView onPlaybooksChanged={() => api.listPlaybooks().then(setPlaybooks)} />}
               {view === "stats" && <StatsView />}
               {view === "audit" && <AuditView openChat={(id) => open(id)} />}
               {view === "settings" && <SettingsView initialSection={settingsSection} />}
+              </Suspense>
             </ErrorBoundary>
           </main>
         </div>
@@ -432,6 +465,7 @@ export default function App() {
             </>
           }
         >
+          {toolPrompt.reason && <Callout kind="warn">{toolPrompt.reason}</Callout>}
           <pre className="code-block mono">{JSON.stringify(toolPrompt.args, null, 2)}</pre>
           <p className="small muted" style={{ marginBottom: 0 }}>Change the default in Extensions → Tools.</p>
         </Modal>
@@ -439,15 +473,6 @@ export default function App() {
       {renaming && (
         <PromptDialog title="Rename chat" label="Title" initial={renaming.title} validate={(x) => (!x.trim() ? "Enter a title" : x.length > 120 ? "Up to 120 characters" : undefined)}
           onSubmit={async (x) => { await api.updateConversation(renaming.id, { title: x }); await refreshConvs(); }} onClose={() => setRenaming(null)} />
-      )}
-      {confirmDel && (
-        <ConfirmDialog title="Delete chat?" onClose={() => setConfirmDel(null)} onConfirm={async () => {
-          await api.deleteConversation(confirmDel.id);
-          if (convId === confirmDel.id) setConvId(null);
-          refreshConvs();
-        }}>
-          “{confirmDel.title}” and all its messages will be removed from this computer.
-        </ConfirmDialog>
       )}
       {bulkDel && (
         <ConfirmDialog title={`Delete ${picked.size} chat${picked.size === 1 ? "" : "s"}?`} onClose={() => setBulkDel(false)} onConfirm={async () => {

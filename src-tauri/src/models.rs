@@ -184,7 +184,7 @@ pub fn heal_model_refs(db: &Db, s: &mut crate::settings::AppSettings) -> bool {
     let before = s.subagents.models.len();
     s.subagents.models.retain(|id| all.iter().any(|m| &m.id == id));
     changed |= before != s.subagents.models.len();
-    for slot in [&mut s.fallback_model, &mut s.roles.planner, &mut s.roles.doer, &mut s.roles.eyes, &mut s.embed_model] {
+    for slot in [&mut s.fallback_model, &mut s.roles.planner, &mut s.roles.doer, &mut s.roles.eyes, &mut s.roles.locator, &mut s.embed_model] {
         if !exists(slot) {
             *slot = None;
             changed = true;
@@ -695,15 +695,16 @@ mod heal_tests {
         let db = Db::open(&dir.join("t.db")).unwrap();
         let pid = add_provider(&db, "openai", "Local", "http://127.0.0.1:1/v1", None).unwrap();
         let mid = add_model(&db, &pid, "m1").unwrap();
-        let mut s = crate::settings::AppSettings::default();
-        s.default_model = Some("deleted-model".into());
-        s.roles.doer = Some("deleted-model".into());
-        s.roles.planner = Some(mid.clone());
+        let mut s = crate::settings::AppSettings {
+            default_model: Some("deleted-model".into()),
+            roles: crate::settings::Roles { doer: Some("deleted-model".into()), planner: Some(mid.clone()), ..Default::default() },
+            ..Default::default()
+        };
         assert!(heal_model_refs(&db, &mut s));
         assert_eq!(s.default_model.as_deref(), Some(mid.as_str()));
         assert_eq!(s.roles.doer, None);
         assert_eq!(s.roles.planner.as_deref(), Some(mid.as_str()));
-        assert!(crate::validate::settings(&s, &[mid.clone()]).is_empty());
+        assert!(crate::validate::settings(&s, std::slice::from_ref(&mid)).is_empty());
         assert!(!heal_model_refs(&db, &mut s), "nothing left to repair");
     }
 }

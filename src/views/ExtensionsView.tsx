@@ -1,5 +1,4 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { open } from "@tauri-apps/plugin-dialog";
 import {
   Blocks, Box, CheckCircle2, CircleAlert, Cpu, Download, FlaskConical, FolderOpen, Globe, Loader2, Package, Pencil, Play, Plug, Plus, Puzzle, RefreshCw, Search,
   Server, Square, Terminal, Trash2, Upload, Wrench,
@@ -245,7 +244,7 @@ function PluginsTab() {
   }, []);
 
   const importFolder = async () => {
-    const dir = await open({ directory: true, title: "Choose a plugin folder (with plugin.json)" });
+    const dir = await api.pickPath("folder", { title: "Choose a plugin folder (with plugin.json)" });
     if (typeof dir !== "string") return;
     try {
       const name = await api.importPlugin(dir);

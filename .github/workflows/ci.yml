@@ -1,0 +1,57 @@
+# Type check, lint and test on every push and pull request. The release workflow runs this first.
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_call:
+
+jobs:
+  checks:
+    name: Checks
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - uses: actions/setup-node@v5
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - name: Type check
+        run: npx tsc --noEmit
+
+      - name: Frontend tests
+        run: npm test
+
+      - name: Dependency audit (npm)
+        run: npm audit --audit-level=moderate
+
+      - name: Build the interface
+        run: npx vite build
+
+      - name: Clippy
+        working-directory: src-tauri
+        run: cargo clippy --all-targets -- -D warnings
+
+      - name: Engine tests
+        working-directory: src-tauri
+        run: cargo test
+
+      - name: Dependency audit (Rust)
+        working-directory: src-tauri
+        run: |
+          cargo install cargo-audit --locked
+          cargo audit

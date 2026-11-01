@@ -18,8 +18,11 @@ npm install
 npm run tauri dev                      # development
 npx tauri build --no-bundle            # optimised app: src-tauri/target/release/computer-agent.exe
 npm run tauri build                    # installers (MSI + NSIS); the Tauri CLI downloads WiX/NSIS on first run
-cd src-tauri && cargo test             # engine tests (safety rules, validation, parsing)
+npm test                               # interface tests (Vitest)
+cd src-tauri && cargo test             # engine tests (safety rules, file rules, validation, parsing)
 ```
+
+CI (`.github/workflows/ci.yml`) type-checks, lints (`clippy -D warnings`), tests and audits dependencies on every push and pull request. Releases build only from `v*` tags (or by hand), after CI passes, as draft releases you publish yourself.
 
 `scripts/mock_llm.py` and `scripts/mock_mcp.py` are a scripted OpenAI-compatible model and a minimal MCP server. Use them to try every flow without a real model or API key:
 
@@ -90,7 +93,15 @@ The mock also streams reasoning: send a message containing "think" (inline `<thi
   - clipboard, system info, open a file, folder or link, notifications
   - shell commands (sandbox first)
   - your plugins and MCP tools
-- **Limits and recovery:** cost, step and time caps; loop detection; retry, then one alternative, then stop with an explanation.
+- **Data protection (fixed engine rules):**
+  - file tools read and write only inside your allowed folders; paths with `..` are refused and links are followed before checking
+  - keys and passwords are never readable: `.ssh`, `.aws`, `.gnupg`, browser profiles, Windows credential folders, `.env` files, key and keystore files (`.pem`, `.key`, `.pfx`, `.kdbx`…) and the app's own data folder
+  - once a task or chat has read local data (files, clipboard, documents, command output), any request that leaves the computer (web search, page fetch, HTTP, download, a link with a query) asks first
+  - devices on this computer or your local network need approval; cloud metadata addresses are always blocked, including through redirects
+  - opening programs or scripts (`.exe`, `.bat`, `.ps1`, `.lnk`…) always asks
+  - if content tries to instruct the AI, every further tool call asks, even with Full access
+  - images in replies are not loaded from the internet (they become links), and the interface runs under a strict Content Security Policy
+- **Limits and recovery:** cost, step and time caps; loop detection; retry, then one alternative, then stop with an explanation. A command or plugin that runs past its time limit is stopped with everything it started.
 - **Queue and resume:** one task controls the desktop at a time; resume after a crash.
 - **Activity log:** screenshots for every step, an undo window for file changes, and saved playbooks.
 
@@ -147,7 +158,7 @@ The mock also streams reasoning: send a message containing "think" (inline `<thi
   - every AI action: chat replies with model, tokens and cost; each tool call with arguments, permission and result; each agent step with Checker verdict and screenshot; approvals and denials
   - app events: start, VM boot, pruning
 - **Secrets are never stored:** API keys, tokens, passwords, headers and environment values are replaced by `[redacted]`, and images and large file bodies are shortened.
-- **Tamper evidence:** each record carries a SHA-256 hash of the record before it. "Verify integrity" finds any edited or deleted record.
+- **Tamper evidence:** each record carries a keyed hash (HMAC-SHA-256, key in the OS credential store) linking it to the record before it. "Verify integrity" finds any edited or deleted record. The log keeps tool calls and commands, not the text of your messages.
 - **Finding things:** search, filters (area, who, result, time range), one session at a time, and pagination with a page-size choice.
 - **Export and retention:** export to CSV or JSON. Retention is a setting; the default is 365 days, and 0 keeps records forever.
 
@@ -257,3 +268,7 @@ There is a **Rust engine** (`src-tauri/src`) and a **React interface** (`src`). 
 - **Sub-agents** need a main model with tool calling; sub-agents themselves get no tools.
 - **Built-in engine:** runs one chat model at a time (plus one embedding model); switching chat models reloads the server. It is unloaded when the app closes normally. After a crash, end any leftover `llama-server` process in Task Manager.
 - **Elevated windows:** admin-level windows can only be controlled when the app runs elevated (a Windows rule).
+
+## License
+
+Licensed under the [Apache License, Version 2.0](LICENSE). Copyright 2026 Anand; see [NOTICE](NOTICE).

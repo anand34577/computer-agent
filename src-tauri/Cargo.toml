@@ -2,6 +2,7 @@
 name = "computer-agent"
 version = "0.1.0"
 edition = "2021"
+license = "Apache-2.0"
 
 [lib]
 name = "computer_agent_lib"
@@ -31,7 +32,7 @@ serde_json = "1.0.154"
 sha2 = "0.10"
 flate2 = "1"
 tar = "0.4"
-zip = { version = "2.4", default-features = false, features = ["deflate"] }
+zip = { version = "9", default-features = false, features = ["deflate"] }
 pdf-extract = "0.12.1"
 sysinfo = "0.40.1"
 tauri = { version = "2.12.5", features = ["tray-icon"] }

@@ -6,12 +6,72 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
-#[derive(Clone, Debug, Serialize, Deserialize, Default)]
+#[derive(Clone, Debug, Serialize, Deserialize)]
 #[serde(default)]
 pub struct Roles {
     pub planner: Option<String>,
     pub doer: Option<String>,
     pub eyes: Option<String>,
+    /// A fast vision grounding model (UI-TARS, Holo, GroundNext, Phi-Ground, Qwen-VL…) that turns
+    /// "the blue Sign in button" into a screen point. The fast "System 1" next to the Doer.
+    pub locator: Option<String>,
+    /// How the locator reports points: "auto", "pixels", "norm1000" (0–1000) or "norm1" (0–1).
+    pub locator_coords: String,
+}
+
+impl Default for Roles {
+    fn default() -> Self {
+        Self { planner: None, doer: None, eyes: None, locator: None, locator_coords: "auto".into() }
+    }
+}
+
+/// The fast decision model ("System 1"), see `decision.rs`.
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(default)]
+pub struct DecisionCfg {
+    pub enabled: bool,
+    /// "gguf": Q8_0 GGUF on the built-in llama.cpp engine; "python": the official PyTorch engine.
+    pub backend: String,
+    /// Where the decision server listens. A local address lets the app start it itself.
+    pub url: String,
+    /// Hugging Face repository of the model (Intern-Decision 0.8B, 2B or 4B).
+    pub model_repo: String,
+    /// "auto", "cuda" or "cpu".
+    pub device: String,
+    /// Start the local server when a task begins.
+    pub autostart: bool,
+    /// Answers below this confidence are ignored and the main model decides as before.
+    pub threshold: f64,
+    /// How long a step may wait for the fast checks before going on without them.
+    pub budget_ms: u64,
+    pub check_loading: bool,
+    pub check_result: bool,
+    pub check_done: bool,
+    pub check_plan: bool,
+    pub check_signin: bool,
+    /// Keep each decision in decisions.jsonl (for checking it or fine-tuning later).
+    pub log: bool,
+}
+
+impl Default for DecisionCfg {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            backend: "gguf".into(),
+            url: "http://127.0.0.1:47615".into(),
+            model_repo: crate::decision::DEFAULT_REPO.into(),
+            device: "auto".into(),
+            autostart: true,
+            threshold: 0.85,
+            budget_ms: 4000,
+            check_loading: true,
+            check_result: true,
+            check_done: true,
+            check_plan: true,
+            check_signin: true,
+            log: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize, Deserialize)]
@@ -254,6 +314,7 @@ pub struct AppSettings {
     // Extensions
     pub sandbox: SandboxCfg,
     pub llama: LlamaCfg,
+    pub decision: DecisionCfg,
     pub mcp_servers: Vec<McpServer>,
     pub plugins: HashMap<String, PluginPref>,
     pub web_search: bool,
@@ -355,6 +416,7 @@ impl Default for AppSettings {
             summon_shortcut: "Ctrl+Shift+F11".into(),
             sandbox: SandboxCfg::default(),
             llama: LlamaCfg::default(),
+            decision: DecisionCfg::default(),
             mcp_servers: vec![],
             plugins: HashMap::new(),
             web_search: true,

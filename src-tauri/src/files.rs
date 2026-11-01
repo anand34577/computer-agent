@@ -7,7 +7,7 @@ use anyhow::{anyhow, bail, Result};
 use rusqlite::params;
 use serde_json::{json, Value};
 use std::fs;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 
 pub struct FileTools<'a> {
     pub db: &'a Db,
@@ -34,9 +34,84 @@ pub fn expand(p: &str) -> PathBuf {
     PathBuf::from(p)
 }
 
-fn norm(p: &Path) -> String {
-    let s = p.to_string_lossy().replace('/', "\\").to_lowercase();
-    if cfg!(windows) { s } else { p.to_string_lossy().to_string() }
+/// The real location of a path: no `.`/`..` tricks, and links followed on the part that exists,
+/// so a folder rule cannot be stepped around by how a path is spelled.
+pub fn resolve(p: &Path) -> Result<PathBuf> {
+    if p.components().any(|c| c == Component::ParentDir) {
+        bail!("Use a full path without '..' ({})", p.display());
+    }
+    let clean: PathBuf = p.components().filter(|c| *c != Component::CurDir).collect();
+    let mut base = clean.clone();
+    let mut rest = vec![];
+    while !base.exists() {
+        match base.file_name() {
+            Some(n) => {
+                rest.push(n.to_os_string());
+                base.pop();
+            }
+            None => break,
+        }
+    }
+    let mut out = fs::canonicalize(&base).map(strip_verbatim).unwrap_or(base);
+    for n in rest.into_iter().rev() {
+        out.push(n);
+    }
+    Ok(out)
+}
+
+/// `\\?\C:\x` → `C:\x` and `\\?\UNC\server\share` → `\\server\share` (what canonicalize returns on Windows).
+fn strip_verbatim(p: PathBuf) -> PathBuf {
+    let s = p.to_string_lossy();
+    if let Some(r) = s.strip_prefix(r"\\?\UNC\") {
+        return PathBuf::from(format!(r"\\{r}"));
+    }
+    if let Some(r) = s.strip_prefix(r"\\?\") {
+        return PathBuf::from(r);
+    }
+    p
+}
+
+/// Comparable form of a path: one separator, no trailing one, case-folded where the OS ignores case.
+fn key(p: &Path) -> String {
+    let s = p.to_string_lossy().replace('\\', "/");
+    let s = s.trim_end_matches('/').to_string();
+    if cfg!(any(windows, target_os = "macos")) { s.to_lowercase() } else { s }
+}
+
+/// Whether `p` is `folder` or inside it, compared by whole path segments.
+pub fn within(p: &Path, folder: &Path) -> bool {
+    let (p, f) = (key(p), key(&resolve(folder).unwrap_or_else(|_| folder.to_path_buf())));
+    !f.is_empty() && (p == f || p.starts_with(&format!("{f}/")))
+}
+
+const SECRET_DIRS: &[&str] = &[
+    "/.ssh/", "/.gnupg/", "/.aws/", "/.azure/", "/.kube/", "/.docker/", "/.password-store/", "/.local/share/keyrings/",
+    "/library/keychains/", "/library/cookies/", "/library/application support/google/chrome/", "/library/application support/firefox/",
+    "/appdata/local/google/chrome/user data/", "/appdata/local/microsoft/edge/user data/", "/appdata/local/bravesoftware/",
+    "/appdata/roaming/mozilla/firefox/profiles/", "/appdata/roaming/microsoft/credentials/", "/appdata/local/microsoft/credentials/",
+    "/appdata/roaming/microsoft/protect/", "/appdata/roaming/microsoft/crypto/", "/windows/system32/config/",
+    "/.config/google-chrome/", "/.config/chromium/", "/.config/bravesoftware/", "/.mozilla/firefox/",
+];
+const SECRET_NAMES: &[&str] = &[".netrc", "_netrc", ".git-credentials", ".npmrc", ".pypirc", ".pgpass", "credentials.json", "secrets.json"];
+const SECRET_PREFIXES: &[&str] = &["id_rsa", "id_dsa", "id_ecdsa", "id_ed25519", ".env"];
+const SECRET_EXTS: &[&str] = &["kdbx", "kdb", "pem", "key", "pfx", "p12", "ppk", "keychain", "keychain-db", "jks", "keystore"];
+
+/// Why a path holds secrets the agent and chat tools may never read (keys, passwords, browser
+/// profiles, this app's own data). A fixed engine rule, not a setting a model can talk around.
+pub fn secret_reason(p: &Path, app_data: &Path) -> Option<String> {
+    if within(p, app_data) {
+        return Some("this app's own data folder".into());
+    }
+    let k = format!("{}/", key(p).to_lowercase());
+    if let Some(d) = SECRET_DIRS.iter().find(|d| k.contains(*d)) {
+        return Some(format!("a folder that holds keys or passwords ({})", d.trim_matches('/')));
+    }
+    let name = p.file_name().map(|n| n.to_string_lossy().to_lowercase()).unwrap_or_default();
+    let ext = p.extension().map(|e| e.to_string_lossy().to_lowercase()).unwrap_or_default();
+    if SECRET_NAMES.contains(&name.as_str()) || SECRET_PREFIXES.iter().any(|x| name.starts_with(x)) || SECRET_EXTS.contains(&ext.as_str()) {
+        return Some(format!("a file that usually holds keys or passwords ({name})"));
+    }
+    None
 }
 
 pub fn cloud_synced(p: &Path) -> bool {
@@ -45,27 +120,44 @@ pub fn cloud_synced(p: &Path) -> bool {
 }
 
 impl<'a> FileTools<'a> {
+    fn app_data(&self) -> PathBuf {
+        self.holding.parent().map(Path::to_path_buf).unwrap_or_else(|| self.holding.clone())
+    }
+
+    /// Rules for reading: never secrets, and only inside the allowed folders.
+    pub fn check_read(&self, p: &Path) -> Result<PathBuf> {
+        check_read(p, self.settings, &self.app_data())
+    }
+
+    /// Rules for changing: the read rules, plus protected folders and the undo area.
     pub fn check(&self, p: &Path) -> Result<()> {
-        if !p.is_absolute() {
-            bail!("Use a full path (for example C:\\Users\\you\\Downloads\\file.txt)");
-        }
-        let n = norm(p);
-        for prot in &self.settings.protected_folders {
-            let pn = norm(Path::new(prot));
-            if !pn.is_empty() && n.starts_with(&pn) {
+        let r = self.check_read(p)?;
+        for prot in self.settings.protected_folders.iter().filter(|x| !x.trim().is_empty()) {
+            if within(&r, Path::new(prot)) {
                 bail!("'{}' is inside a protected folder ({prot}). The agent may not change it.", p.display());
             }
         }
-        if !self.settings.allowed_folders.is_empty()
-            && !self.settings.allowed_folders.iter().any(|a| !a.is_empty() && n.starts_with(&norm(Path::new(a))))
-        {
-            bail!("'{}' is outside the allowed folders. Add it in Settings → Permissions.", p.display());
-        }
-        if n.contains(&norm(&self.holding)) {
-            bail!("The undo holding area is off-limits");
-        }
         Ok(())
     }
+}
+
+/// Read rules without a task (shared by the search tools, which walk folders).
+pub fn check_read(p: &Path, s: &AppSettings, app_data: &Path) -> Result<PathBuf> {
+    if !p.is_absolute() {
+        bail!("Use a full path (for example C:\\Users\\you\\Downloads\\file.txt)");
+    }
+    let r = resolve(p)?;
+    if let Some(why) = secret_reason(&r, app_data) {
+        bail!("'{}' is off-limits: {why}. Open it yourself if you need it.", p.display());
+    }
+    let allowed: Vec<&String> = s.allowed_folders.iter().filter(|a| !a.trim().is_empty()).collect();
+    if !allowed.is_empty() && !allowed.iter().any(|a| within(&r, Path::new(a.as_str()))) {
+        bail!("'{}' is outside the allowed folders. Add it in Settings → Permissions.", p.display());
+    }
+    Ok(r)
+}
+
+impl<'a> FileTools<'a> {
 
     fn record(&self, op: &str, original: &Path, current: &Path, backup: &str) -> Result<()> {
         self.db.conn.lock().execute(
@@ -98,6 +190,7 @@ impl<'a> FileTools<'a> {
         match tool {
             "list_files" => {
                 let p = expand(a["path"].as_str().unwrap_or(""));
+                self.check_read(&p)?;
                 let mut out = vec![];
                 for e in fs::read_dir(&p).map_err(|e| anyhow!("Cannot open {}: {e}", p.display()))?.flatten().take(400) {
                     let md = e.metadata().ok();
@@ -110,6 +203,7 @@ impl<'a> FileTools<'a> {
             }
             "read_file" => {
                 let p = expand(a["path"].as_str().unwrap_or(""));
+                self.check_read(&p)?;
                 let bytes = fs::read(&p).map_err(|e| anyhow!("Cannot read {}: {e}", p.display()))?;
                 let text = String::from_utf8_lossy(&bytes);
                 let t: String = text.chars().take(20000).collect();
@@ -289,5 +383,80 @@ pub fn purge_expired(db: &Db, holding: &Path, hours: u32) {
             let _ = fs::remove_dir_all(holding.join(&t));
             let _ = db.conn.lock().execute("UPDATE undo_ops SET undone=2 WHERE task_id=?1", [&t]);
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn temp(name: &str) -> PathBuf {
+        let d = std::env::temp_dir().join(format!("ca-files-{name}-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&d);
+        fs::create_dir_all(&d).unwrap();
+        d
+    }
+
+    fn settings(allowed: &Path, protected: &Path) -> AppSettings {
+        AppSettings { allowed_folders: vec![allowed.to_string_lossy().into()], protected_folders: vec![protected.to_string_lossy().into()], ..AppSettings::default() }
+    }
+
+    #[test]
+    fn dot_dot_paths_are_refused() {
+        let d = temp("dots");
+        assert!(resolve(&d.join("a").join("..").join("b")).is_err());
+        assert_eq!(key(&resolve(&d.join(".").join("new.txt")).unwrap()), key(&resolve(&d).unwrap().join("new.txt")));
+    }
+
+    #[test]
+    fn within_compares_whole_segments() {
+        let d = temp("within");
+        fs::create_dir_all(d.join("Work")).unwrap();
+        assert!(within(&d.join("Work").join("x.txt"), &d.join("Work")));
+        assert!(!within(&d.join("Workshop").join("x.txt"), &d.join("Work")), "a shared prefix is not the same folder");
+    }
+
+    #[test]
+    fn secrets_are_never_readable() {
+        let app = Path::new("/nonexistent-app-data");
+        for p in ["/home/u/.ssh/id_ed25519", "/home/u/project/.env", "/home/u/vault.kdbx", "C:/Users/u/AppData/Local/Google/Chrome/User Data/Default/Login Data"] {
+            assert!(secret_reason(Path::new(p), app).is_some(), "{p}");
+        }
+        assert!(secret_reason(Path::new("/home/u/notes/environment.md"), app).is_none());
+    }
+
+    #[test]
+    fn read_and_write_rules() {
+        let root = temp("rules");
+        let (allowed, protected, app) = (root.join("allowed"), root.join("allowed").join("locked"), root.join("appdata"));
+        fs::create_dir_all(&protected).unwrap();
+        let s = settings(&allowed, &protected);
+        assert!(check_read(&allowed.join("a.txt"), &s, &app).is_ok());
+        assert!(check_read(&root.join("outside.txt"), &s, &app).is_err(), "outside the allowed folders");
+        assert!(check_read(&allowed.join("..").join("outside.txt"), &s, &app).is_err(), "'..' cannot step out");
+        assert!(check_read(&app.join("agent.db"), &s, &app).is_err(), "the app's own data");
+        let db = crate::db::Db::open(&root.join("t.db")).unwrap();
+        let ft = FileTools { db: &db, holding: app.join("holding"), task_id: "t".into(), settings: &s };
+        assert!(ft.check(&protected.join("x.txt")).is_err(), "protected folders cannot change");
+        assert!(ft.check(&allowed.join("x.txt")).is_ok());
+    }
+
+    #[test]
+    fn write_then_undo_restores() {
+        let root = temp("undo");
+        let (allowed, app) = (root.join("work"), root.join("appdata"));
+        fs::create_dir_all(&allowed).unwrap();
+        let s = settings(&allowed, &root.join("none"));
+        let db = crate::db::Db::open(&root.join("t.db")).unwrap();
+        let ft = FileTools { db: &db, holding: app.join("holding"), task_id: "t1".into(), settings: &s };
+        let f = allowed.join("note.txt");
+        fs::write(&f, "before").unwrap();
+        ft.run("write_file", &json!({"path": f.to_string_lossy(), "content": "after"})).unwrap();
+        ft.run("write_file", &json!({"path": allowed.join("new.txt").to_string_lossy(), "content": "x"})).unwrap();
+        assert_eq!(fs::read_to_string(&f).unwrap(), "after");
+        let r = undo_task(&db, &app.join("holding"), "t1").unwrap();
+        assert_eq!(r["restored"], 2);
+        assert_eq!(fs::read_to_string(&f).unwrap(), "before");
+        assert!(!allowed.join("new.txt").exists());
     }
 }
