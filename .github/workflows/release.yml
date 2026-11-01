@@ -1,0 +1,86 @@
+# Builds the desktop app for Windows, macOS (Apple Silicon and Intel) and Linux and publishes the
+# installers to a GitHub Release named after the version in src-tauri/tauri.conf.json.
+# Runs on every push to main (updating that version's release) and on version tags.
+name: Release
+
+on:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: ${{ matrix.name }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: Windows x64
+            platform: windows-latest
+            args: ""
+            targets: ""
+          - name: macOS Apple Silicon
+            platform: macos-latest
+            args: "--target aarch64-apple-darwin"
+            targets: aarch64-apple-darwin
+          - name: macOS Intel
+            platform: macos-latest
+            args: "--target x86_64-apple-darwin"
+            targets: x86_64-apple-darwin
+          - name: Linux x64
+            platform: ubuntu-22.04
+            args: ""
+            targets: ""
+    runs-on: ${{ matrix.platform }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: startsWith(matrix.platform, 'ubuntu')
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libappindicator3-dev librsvg2-dev patchelf \
+            libxdo-dev libdbus-1-dev libssl-dev pkg-config clang \
+            libpipewire-0.3-dev libwayland-dev libegl1-mesa-dev libgbm-dev \
+            libxcb1-dev libxcb-randr0-dev libxcb-shm0-dev libxrandr-dev libxtst-dev libxi-dev
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: npm
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.targets }}
+
+      - uses: swatinem/rust-cache@v2
+        with:
+          workspaces: src-tauri -> target
+          key: ${{ matrix.targets }}
+
+      - name: Install frontend dependencies
+        run: npm ci
+
+      - uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          tagName: v__VERSION__
+          releaseName: Computer Agent v__VERSION__
+          releaseBody: |
+            Installers for Windows, macOS and Linux, built automatically from `${{ github.sha }}`.
+
+            - **Windows:** `.msi` or `-setup.exe`
+            - **macOS:** `.dmg` (`aarch64` for Apple Silicon, `x64` for Intel). The builds are not notarised: right-click the app and choose Open the first time.
+            - **Linux:** `.AppImage`, `.deb` or `.rpm`
+          releaseDraft: false
+          prerelease: false
+          args: ${{ matrix.args }}

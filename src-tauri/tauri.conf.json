@@ -1,0 +1,76 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Computer Agent",
+  "version": "0.1.0",
+  "identifier": "dev.computeragent.app",
+  "build": {
+    "beforeDevCommand": "npm run dev",
+    "devUrl": "http://localhost:1420",
+    "beforeBuildCommand": "npm run build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Computer Agent",
+        "url": "index.html",
+        "width": 1240,
+        "height": 740,
+        "minWidth": 900,
+        "minHeight": 560,
+        "center": true,
+        "create": false,
+        "decorations": false,
+        "shadow": true,
+        "transparent": false,
+        "dragDropEnabled": false
+      },
+      {
+        "label": "bar",
+        "title": "Agent Bar",
+        "url": "index.html#bar",
+        "width": 560,
+        "height": 64,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "shadow": false,
+        "create": false
+      },
+      {
+        "label": "pointer",
+        "title": "Agent Pointer",
+        "url": "index.html#pointer",
+        "width": 64,
+        "height": 64,
+        "resizable": false,
+        "decorations": false,
+        "transparent": true,
+        "alwaysOnTop": true,
+        "skipTaskbar": true,
+        "visible": false,
+        "focus": false,
+        "shadow": false,
+        "create": false
+      }
+    ],
+    "security": {
+      "csp": null
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ]
+  }
+}
