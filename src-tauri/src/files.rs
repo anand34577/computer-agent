@@ -80,7 +80,7 @@ fn key(p: &Path) -> String {
 
 /// Whether `p` is `folder` or inside it, compared by whole path segments.
 pub fn within(p: &Path, folder: &Path) -> bool {
-    let (p, f) = (key(p), key(&resolve(folder).unwrap_or_else(|_| folder.to_path_buf())));
+    let (p, f) = (key(&resolve(p).unwrap_or_else(|_| p.to_path_buf())), key(&resolve(folder).unwrap_or_else(|_| folder.to_path_buf())));
     !f.is_empty() && (p == f || p.starts_with(&format!("{f}/")))
 }
 
